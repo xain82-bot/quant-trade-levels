@@ -1,0 +1,1055 @@
+# =============================================================================
+# Quant Trade Levels — Streamlit Technical Analysis Dashboard
+# =============================================================================
+# requirements.txt
+# -----------------------------------------------------------------------------
+# streamlit>=1.30.0
+# yfinance>=0.2.40
+# pandas>=2.0.0
+# numpy>=1.24.0
+# ta>=0.11.0
+# plotly>=5.18.0
+# -----------------------------------------------------------------------------
+# Run with:  streamlit run app.py
+# =============================================================================
+
+from __future__ import annotations
+
+import datetime as _dt
+import json as _json
+from urllib.request import Request, urlopen
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+from plotly.subplots import make_subplots
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator, MACD
+from ta.volatility import AverageTrueRange
+
+# -----------------------------------------------------------------------------
+# Page configuration
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Quant Trade Levels",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+PERIOD_OPTIONS = {
+    "6 Months": "6mo",
+    "1 Year": "1y",
+    "2 Years": "2y",
+    "5 Years": "5y",
+}
+
+COLOR_S1 = "#00C853"      # green
+COLOR_S2 = "#1B5E20"      # dark green
+COLOR_SL = "#D50000"      # red
+COLOR_TP1 = "#2962FF"     # blue
+COLOR_TP2 = "#AA00FF"     # purple
+COLOR_EMA20 = "#FF9100"   # orange
+COLOR_EMA50 = "#00B8D4"   # cyan
+
+
+# -----------------------------------------------------------------------------
+# Data layer
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def load_price_data(ticker: str, period: str) -> pd.DataFrame:
+    """Download daily OHLCV data for `ticker`. Returns a clean, single-level
+    DataFrame indexed by date. Raises ValueError on missing/invalid data."""
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise ValueError("No ticker symbol provided.")
+
+    raw = yf.download(
+        ticker,
+        period=period,
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
+
+    if raw is None or raw.empty:
+        raise ValueError(
+            f"No data returned for '{ticker}'. It may be an invalid symbol, "
+            f"delisted, or temporarily unavailable."
+        )
+
+    # yfinance can return a MultiIndex on columns (Price, Ticker). Flatten it.
+    if isinstance(raw.columns, pd.MultiIndex):
+        # Prefer the level that contains OHLC field names.
+        lvl0 = set(raw.columns.get_level_values(0))
+        if {"Open", "High", "Low", "Close"}.issubset(lvl0):
+            raw.columns = raw.columns.get_level_values(0)
+        else:
+            raw.columns = raw.columns.get_level_values(-1)
+
+    raw = raw.rename(columns=str.title)
+
+    required = {"Open", "High", "Low", "Close"}
+    if not required.issubset(set(raw.columns)):
+        raise ValueError(
+            f"Downloaded data for '{ticker}' is missing required OHLC columns."
+        )
+
+    df = raw[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in raw.columns]].copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+
+    if len(df) < 60:
+        raise ValueError(
+            f"Only {len(df)} valid trading days available for '{ticker}'. "
+            f"Need at least 60 for reliable EMA(50) / indicators. "
+            f"Try a longer lookback period."
+        )
+
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_ticker_name(ticker: str) -> str:
+    """Best-effort long name lookup. Falls back to the symbol on any failure."""
+    ticker = ticker.strip().upper()
+    try:
+        info = yf.Ticker(ticker).info or {}
+        return info.get("longName") or info.get("shortName") or ticker
+    except Exception:
+        return ticker
+
+
+# -----------------------------------------------------------------------------
+# CSV loader (Investing.com / TradingView exports — e.g. KSE All Share Index)
+# -----------------------------------------------------------------------------
+def _clean_numeric(series: pd.Series) -> pd.Series:
+    """Coerce a column of strings like '45,678.90', '1.23B', '(1.5)', '2.4%'
+    into floats. Handles thousands-commas and K/M/B volume suffixes."""
+    def one(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return np.nan
+        s = str(v).strip().replace(",", "").replace("%", "").replace('"', "")
+        if s in ("", "-", "N/A", "nan", "None"):
+            return np.nan
+        neg = s.startswith("(") and s.endswith(")")
+        s = s.strip("()").replace("+", "")
+        mult = 1.0
+        if s and s[-1] in "KkMmBbTt":
+            mult = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[s[-1].lower()]
+            s = s[:-1]
+        try:
+            val = float(s) * mult
+        except ValueError:
+            return np.nan
+        return -val if neg else val
+
+    return series.map(one)
+
+
+def load_csv_data(uploaded_file) -> pd.DataFrame:
+    """Parse a historical-price CSV exported from Investing.com or TradingView
+    into the same OHLC frame `load_price_data` produces."""
+    try:
+        raw = pd.read_csv(uploaded_file)
+    except Exception as e:
+        raise ValueError(f"Could not read the CSV file: {e}")
+
+    if raw.empty:
+        raise ValueError("The uploaded CSV is empty.")
+
+    # Normalise headers: lower-case, strip, drop punctuation like 'Vol.'.
+    norm = {c: str(c).strip().lower().rstrip(".") for c in raw.columns}
+    raw = raw.rename(columns=norm)
+    cols = set(raw.columns)
+
+    # Locate the date/time column.
+    date_col = next((c for c in ("date", "time", "datetime", "timestamp") if c in cols), None)
+    if date_col is None:
+        raise ValueError(
+            "No date column found. Expected a 'Date' (Investing.com) or "
+            "'time' (TradingView) column."
+        )
+
+    # Locate the close column: TradingView uses 'close', Investing.com 'price'.
+    close_col = next((c for c in ("close", "price", "last", "adj close") if c in cols), None)
+    if close_col is None:
+        raise ValueError(
+            "No close/price column found. Expected 'Close' (TradingView) or "
+            "'Price' (Investing.com)."
+        )
+
+    out = pd.DataFrame()
+    out["Close"] = _clean_numeric(raw[close_col])
+    # OHLC — fall back to Close when a column is absent.
+    out["Open"] = _clean_numeric(raw["open"]) if "open" in cols else out["Close"]
+    out["High"] = _clean_numeric(raw["high"]) if "high" in cols else out["Close"]
+    out["Low"] = _clean_numeric(raw["low"]) if "low" in cols else out["Close"]
+    vol_col = next((c for c in ("volume", "vol") if c in cols), None)
+    out["Volume"] = _clean_numeric(raw[vol_col]) if vol_col else 0.0
+
+    # Parse dates. TradingView may store unix seconds; Investing.com uses text.
+    idx = raw[date_col]
+    if pd.api.types.is_numeric_dtype(idx):
+        parsed = pd.to_datetime(idx, unit="s", errors="coerce")
+    else:
+        parsed = pd.to_datetime(idx, errors="coerce")
+        if parsed.isna().mean() > 0.3:  # retry with day-first (DD/MM/YYYY)
+            parsed = pd.to_datetime(idx, errors="coerce", dayfirst=True)
+    out.index = parsed
+
+    out = out.dropna(subset=["Close"])
+    out = out[~out.index.isna()]
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+
+    if len(out) < 60:
+        raise ValueError(
+            f"Only {len(out)} usable rows parsed from the CSV. Need at least 60. "
+            f"Export a longer daily history (1y+) from Investing.com / TradingView."
+        )
+    return out
+
+
+# -----------------------------------------------------------------------------
+# PSX Data Portal loader (dps.psx.com.pk) — official KSE index data
+# -----------------------------------------------------------------------------
+# Symbol -> friendly label for the PSX end-of-day index feed.
+PSX_INDICES = {
+    "ALLSHR": "KSE All Share Index",
+    "KSE100": "KSE 100 Index",
+    "KSE30": "KSE 30 Index",
+    "KMI30": "KMI 30 Index",
+    "KMIALLSHR": "KMI All Share Index",
+    "PSXDIV20": "PSX Dividend 20 Index",
+}
+
+# Lookback label -> approximate calendar days, for trimming PSX history.
+PERIOD_DAYS = {"6mo": 182, "1y": 365, "2y": 730, "5y": 1825}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_psx_data(symbol: str, period: str = "5y") -> pd.DataFrame:
+    """Fetch daily index data from the PSX Data Portal end-of-day API.
+
+    The feed returns rows of [unix_ts, close, volume, extra]; it is close-only
+    (no per-day OHLC), so Open/High/Low are set equal to Close and the frame is
+    flagged via `df.attrs['has_ohlc'] = False` so the chart draws a line."""
+    symbol = symbol.strip().upper()
+    url = f"https://dps.psx.com.pk/timeseries/eod/{symbol}"
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://dps.psx.com.pk/",
+        },
+    )
+    try:
+        with urlopen(req, timeout=25) as resp:
+            payload = _json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception as e:
+        raise ValueError(
+            f"Could not reach the PSX Data Portal for '{symbol}': {e}. "
+            f"Check your connection or try again shortly."
+        )
+
+    if not isinstance(payload, dict) or payload.get("status") != 1:
+        raise ValueError(
+            f"PSX Data Portal returned no data for '{symbol}'. "
+            f"Verify the index symbol."
+        )
+
+    rows = payload.get("data") or []
+    if not rows:
+        raise ValueError(f"PSX Data Portal returned an empty series for '{symbol}'.")
+
+    recs = []
+    for r in rows:
+        try:
+            ts, close = r[0], float(r[1])
+            vol = float(r[2]) if len(r) > 2 and r[2] is not None else 0.0
+        except (TypeError, ValueError, IndexError):
+            continue
+        recs.append((pd.to_datetime(int(ts), unit="s"), close, vol))
+
+    if not recs:
+        raise ValueError(f"Could not parse any rows from PSX data for '{symbol}'.")
+
+    df = pd.DataFrame(recs, columns=["Date", "Close", "Volume"]).set_index("Date")
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+
+    # Close-only feed: mirror Close into OHLC so downstream code is uniform.
+    df["Open"] = df["Close"]
+    df["High"] = df["Close"]
+    df["Low"] = df["Close"]
+    df = df[["Open", "High", "Low", "Close", "Volume"]]
+
+    # Trim to the requested lookback window.
+    df = _trim_period(df, period)
+
+    if len(df) < 60:
+        raise ValueError(
+            f"Only {len(df)} rows available for '{symbol}'. Need at least 60."
+        )
+
+    df.attrs["has_ohlc"] = False
+    return df
+
+
+def _trim_period(df: pd.DataFrame, period: str, min_rows: int = 60) -> pd.DataFrame:
+    """Slice a frame to the requested lookback, keeping at least `min_rows`."""
+    days = PERIOD_DAYS.get(period, 1825)
+    cutoff = df.index.max() - pd.Timedelta(days=days)
+    trimmed = df[df.index >= cutoff]
+    return trimmed if len(trimmed) >= min_rows else df
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_psx_symbols() -> dict:
+    """Fetch the PSX listed-symbol master list and return {symbol: name} for
+    ordinary equities (excluding debt/TFC instruments, ETFs and derivatives)."""
+    req = Request(
+        "https://dps.psx.com.pk/symbols",
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://dps.psx.com.pk/",
+        },
+    )
+    try:
+        with urlopen(req, timeout=25) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception as e:
+        raise ValueError(f"Could not fetch the PSX symbol list: {e}")
+
+    out = {}
+    for item in data or []:
+        sym = str(item.get("symbol", "")).strip().upper()
+        if not sym or item.get("isDebt") or item.get("isETF"):
+            continue
+        if "-" in sym:  # skip futures / deliverable-future style tickers
+            continue
+        out[sym] = str(item.get("name", sym)).strip() or sym
+    if not out:
+        raise ValueError("PSX symbol list came back empty.")
+    return dict(sorted(out.items()))
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_psx_stock(symbol: str, period: str = "1y") -> pd.DataFrame:
+    """Load a single PSX stock. Prefers Yahoo Finance (`SYMBOL.KA`) for genuine
+    OHLC candles; if Yahoo has no data, falls back to the PSX Data Portal's
+    close-only feed (line chart). The chosen source is recorded in
+    `df.attrs['source']`."""
+    symbol = symbol.strip().upper()
+
+    # --- Preferred: Yahoo Finance .KA (full OHLC) ---------------------------
+    try:
+        ydf = load_price_data(f"{symbol}.KA", period)
+        ydf.attrs["has_ohlc"] = True
+        ydf.attrs["source"] = "yahoo"
+        return ydf
+    except Exception:
+        pass  # fall through to PSX close-only
+
+    # --- Fallback: PSX Data Portal (close-only) -----------------------------
+    try:
+        pdf = load_psx_data(symbol, period)  # already flags has_ohlc=False
+        pdf.attrs["source"] = "psx"
+        return pdf
+    except Exception as e:
+        raise ValueError(
+            f"No data available for '{symbol}' from Yahoo (.KA) or the PSX "
+            f"Data Portal. It may be newly listed, suspended, or delisted. ({e})"
+        )
+
+
+# -----------------------------------------------------------------------------
+# Indicator + level engine
+# -----------------------------------------------------------------------------
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach EMA20/50, RSI14, MACD(12,26,9) and ATR14 columns."""
+    df = df.copy()
+    close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+
+    df["EMA20"] = EMAIndicator(close=close, window=20).ema_indicator()
+    df["EMA50"] = EMAIndicator(close=close, window=50).ema_indicator()
+    df["RSI"] = RSIIndicator(close=close, window=14).rsi()
+
+    macd = MACD(close=close, window_slow=26, window_fast=12, window_sign=9)
+    df["MACD"] = macd.macd()
+    df["MACD_Signal"] = macd.macd_signal()
+    df["MACD_Hist"] = macd.macd_diff()
+
+    df["ATR"] = AverageTrueRange(
+        high=high, low=low, close=close, window=14
+    ).average_true_range()
+
+    return df
+
+
+def classic_pivots(prev_high: float, prev_low: float, prev_close: float) -> dict:
+    """Classic (floor-trader) daily pivot points from the previous session."""
+    p = (prev_high + prev_low + prev_close) / 3.0
+    s1 = (2 * p) - prev_high
+    r1 = (2 * p) - prev_low
+    s2 = p - (prev_high - prev_low)
+    r2 = p + (prev_high - prev_low)
+    return {"P": p, "S1": s1, "S2": s2, "R1": r1, "R2": r2}
+
+
+def compute_trade_plan(
+    df: pd.DataFrame,
+    atr_mult: float,
+    rr_tp1: float,
+    rr_tp2: float,
+) -> dict:
+    """Build the full trade plan (levels, bias, indicator snapshot)."""
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    current_price = float(last["Close"])
+    prev_close = float(prev["Close"])
+    daily_change = current_price - prev_close
+    daily_change_pct = (daily_change / prev_close) * 100 if prev_close else 0.0
+
+    ema20 = float(last["EMA20"])
+    ema50 = float(last["EMA50"])
+    rsi = float(last["RSI"])
+    macd_hist = float(last["MACD_Hist"])
+    atr = float(last["ATR"])
+
+    # Pivots from the most recent completed session.
+    piv = classic_pivots(float(last["High"]), float(last["Low"]), float(last["Close"]))
+
+    # --- Trend / momentum bias ------------------------------------------------
+    bull_signals = 0
+    bear_signals = 0
+
+    if ema20 > ema50:
+        bull_signals += 1
+    else:
+        bear_signals += 1
+
+    if macd_hist > 0:
+        bull_signals += 1
+    else:
+        bear_signals += 1
+
+    if current_price > ema20:
+        bull_signals += 1
+    else:
+        bear_signals += 1
+
+    if bull_signals >= 2 and rsi <= 70:
+        bias = "Bullish"
+    elif bear_signals >= 2:
+        bias = "Bearish"
+    else:
+        bias = "Neutral"
+
+    overbought = rsi > 70
+
+    # --- Entry levels ---------------------------------------------------------
+    # Two candidate support confluences:
+    #   • EMA20 blended with Classic Support S1 (the nearer/shallower zone)
+    #   • EMA50 blended with Classic Support S2 (the deeper zone)
+    cand_a = (ema20 + piv["S1"]) / 2.0
+    cand_b = (ema50 + piv["S2"]) / 2.0
+
+    # Enforce the invariant: Primary (S1) is the shallower (higher) support,
+    # Deep (S2) is the lower one. In a downtrend EMA50 > EMA20, which can push
+    # the EMA50 blend above the EMA20 blend, so we order rather than assume.
+    s1_entry = round(max(cand_a, cand_b), 2)
+    s2_entry = round(min(cand_a, cand_b), 2)
+
+    # Guard against a degenerate tie so S2 is always a genuinely deeper entry.
+    if s1_entry - s2_entry < 0.01:
+        s2_entry = round(s1_entry - max(0.5 * atr, 0.01 * s1_entry), 2)
+
+    # --- Risk levels ----------------------------------------------------------
+    stop_loss = round(s1_entry - (atr_mult * atr), 2)
+    risk = s1_entry - stop_loss  # per-share risk (positive when SL below entry)
+
+    tp1 = round(s1_entry + rr_tp1 * risk, 2)
+    tp2_rr = s1_entry + rr_tp2 * risk
+    # TP2 = the more ambitious of the RR target and Classic Resistance R2.
+    tp2 = round(max(tp2_rr, piv["R2"]), 2)
+
+    realized_rr_tp2 = (tp2 - s1_entry) / risk if risk > 0 else float("nan")
+
+    return {
+        "current_price": current_price,
+        "daily_change": daily_change,
+        "daily_change_pct": daily_change_pct,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi": rsi,
+        "macd_hist": macd_hist,
+        "atr": atr,
+        "pivots": piv,
+        "bias": bias,
+        "overbought": overbought,
+        "s1_entry": s1_entry,
+        "s2_entry": s2_entry,
+        "stop_loss": stop_loss,
+        "risk": risk,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr_tp1": rr_tp1,
+        "rr_tp2": rr_tp2,
+        "realized_rr_tp2": realized_rr_tp2,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Presentation helpers
+# -----------------------------------------------------------------------------
+def bias_badge(bias: str) -> str:
+    palette = {
+        "Bullish": ("#00C853", "#052e16"),
+        "Bearish": ("#D50000", "#3b0a0a"),
+        "Neutral": ("#FFB300", "#332600"),
+    }
+    fg, bg = palette.get(bias, ("#9E9E9E", "#1a1a1a"))
+    return (
+        f"<span style='background:{bg};color:{fg};padding:6px 16px;"
+        f"border-radius:20px;font-weight:700;font-size:0.95rem;"
+        f"border:1px solid {fg};letter-spacing:0.5px;'>{bias.upper()}</span>"
+    )
+
+
+def pct_from_price(level: float, price: float) -> float:
+    return ((level - price) / price) * 100 if price else float("nan")
+
+
+def build_summary_table(plan: dict) -> pd.DataFrame:
+    price = plan["current_price"]
+    rows = [
+        ("Primary Entry (S1)", plan["s1_entry"], "Main accumulation zone (EMA20 / Pivot S1)"),
+        ("Deep Entry (S2)", plan["s2_entry"], "Extended pullback (EMA50 / Pivot S2)"),
+        ("Stop Loss (SL)", plan["stop_loss"], "Invalidation zone — thesis fails below"),
+        ("Take Profit 1 (TP1)", plan["tp1"], f"{plan['rr_tp1']:.1f}x R:R — scale out"),
+        ("Take Profit 2 (TP2)", plan["tp2"], f"{plan['rr_tp2']:.1f}x R:R / Pivot R2 — runner"),
+    ]
+    data = []
+    for label, level, note in rows:
+        data.append(
+            {
+                "Level Type": label,
+                "Target Price ($)": f"{level:,.2f}",
+                "% From Current": f"{pct_from_price(level, price):+.2f}%",
+                "Strategic Notes": note,
+            }
+        )
+    return pd.DataFrame(data)
+
+
+def build_chart(df: pd.DataFrame, plan: dict, ticker: str) -> go.Figure:
+    """3-row subplot: price+levels, RSI, MACD."""
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.62, 0.19, 0.19],
+        subplot_titles=("Price Action & Trade Levels", "RSI (14)", "MACD (12, 26, 9)"),
+    )
+
+    # --- Row 1: price (candles when OHLC is real, else a line) + EMAs ---------
+    has_ohlc = df.attrs.get("has_ohlc", True)
+    if has_ohlc:
+        fig.add_trace(
+            go.Candlestick(
+                x=df.index,
+                open=df["Open"],
+                high=df["High"],
+                low=df["Low"],
+                close=df["Close"],
+                name="Price",
+                increasing_line_color="#26A69A",
+                decreasing_line_color="#EF5350",
+            ),
+            row=1,
+            col=1,
+        )
+    else:
+        # Close-only source (e.g. PSX index feed): draw a price line.
+        fig.add_trace(
+            go.Scatter(
+                x=df.index, y=df["Close"], name="Close",
+                line=dict(color="#26A69A", width=1.8),
+            ),
+            row=1, col=1,
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=df.index, y=df["EMA20"], name="EMA 20",
+            line=dict(color=COLOR_EMA20, width=1.4),
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df.index, y=df["EMA50"], name="EMA 50",
+            line=dict(color=COLOR_EMA50, width=1.4),
+        ),
+        row=1, col=1,
+    )
+
+    # Horizontal trade levels
+    level_lines = [
+        ("S1 Entry", plan["s1_entry"], COLOR_S1),
+        ("S2 Entry", plan["s2_entry"], COLOR_S2),
+        ("Stop Loss", plan["stop_loss"], COLOR_SL),
+        ("TP1", plan["tp1"], COLOR_TP1),
+        ("TP2", plan["tp2"], COLOR_TP2),
+    ]
+    x0, x1 = df.index[0], df.index[-1]
+    for label, level, color in level_lines:
+        fig.add_trace(
+            go.Scatter(
+                x=[x0, x1],
+                y=[level, level],
+                mode="lines",
+                name=f"{label} ({level:,.2f})",
+                line=dict(color=color, width=1.6, dash="dash"),
+                hoverinfo="name",
+            ),
+            row=1, col=1,
+        )
+        fig.add_annotation(
+            x=x1, y=level, text=f"{label}: {level:,.2f}",
+            showarrow=False, xanchor="left", yanchor="middle",
+            font=dict(color=color, size=10), xshift=6, row=1, col=1,
+        )
+
+    # --- Row 2: RSI -----------------------------------------------------------
+    fig.add_trace(
+        go.Scatter(
+            x=df.index, y=df["RSI"], name="RSI",
+            line=dict(color="#7E57C2", width=1.3),
+        ),
+        row=2, col=1,
+    )
+    fig.add_hline(y=70, line=dict(color=COLOR_SL, width=1, dash="dot"), row=2, col=1)
+    fig.add_hline(y=30, line=dict(color=COLOR_S1, width=1, dash="dot"), row=2, col=1)
+    fig.add_hrect(y0=70, y1=100, fillcolor=COLOR_SL, opacity=0.06, line_width=0, row=2, col=1)
+    fig.add_hrect(y0=0, y1=30, fillcolor=COLOR_S1, opacity=0.06, line_width=0, row=2, col=1)
+    fig.update_yaxes(range=[0, 100], row=2, col=1)
+
+    # --- Row 3: MACD ----------------------------------------------------------
+    hist_colors = np.where(df["MACD_Hist"] >= 0, "#26A69A", "#EF5350")
+    fig.add_trace(
+        go.Bar(
+            x=df.index, y=df["MACD_Hist"], name="Histogram",
+            marker_color=hist_colors, opacity=0.6,
+        ),
+        row=3, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df.index, y=df["MACD"], name="MACD",
+            line=dict(color=COLOR_TP1, width=1.3),
+        ),
+        row=3, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df.index, y=df["MACD_Signal"], name="Signal",
+            line=dict(color=COLOR_EMA20, width=1.3),
+        ),
+        row=3, col=1,
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=820,
+        margin=dict(l=40, r=90, t=40, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        title=dict(text=f"{ticker} — Daily", x=0.01, font=dict(size=16)),
+    )
+    fig.update_xaxes(rangeslider_visible=False)
+    return fig
+
+
+# -----------------------------------------------------------------------------
+# Sidebar
+# -----------------------------------------------------------------------------
+def render_sidebar() -> dict:
+    st.sidebar.title("⚙️ Controls")
+
+    source = st.sidebar.radio(
+        "Data Source",
+        options=[
+            "Yahoo Finance (ticker)",
+            "PSX Stock (KSE All Share)",
+            "PSX Index (KSE indices)",
+            "Upload CSV (any instrument)",
+        ],
+        index=0,
+        help=(
+            "Yahoo: US/global tickers + PSX stocks (e.g. HBL.KA). "
+            "PSX Stock: pick any KSE All Share constituent — OHLC candles from "
+            "Yahoo where available, else PSX Data Portal close-only. "
+            "PSX Index: official KSE indices incl. the All Share aggregate. "
+            "Upload CSV: any history exported from Investing.com / TradingView."
+        ),
+    )
+    is_psx_stock = source.startswith("PSX Stock")
+    is_psx = source.startswith("PSX Index")
+    is_csv = source.startswith("Upload")
+
+    ticker = "NVDA"
+    csv_label = "KSE All Share Index"
+    uploaded_file = None
+    psx_symbol = "ALLSHR"
+    psx_stock_symbol = None
+
+    if is_psx_stock:
+        try:
+            symbols = load_psx_symbols()
+        except Exception as e:
+            st.sidebar.error(f"Could not load PSX constituents: {e}")
+            symbols = {}
+        if symbols:
+            opts = list(symbols.keys())
+            default_idx = opts.index("HBL") if "HBL" in symbols else 0
+            psx_stock_symbol = st.sidebar.selectbox(
+                f"PSX Stock ({len(opts)} listed)",
+                options=opts,
+                index=default_idx,
+                format_func=lambda s: f"{s} — {symbols.get(s, '')[:26]}",
+                help="Searchable — type a symbol like OGDC, LUCK, MEBL.",
+            )
+            st.sidebar.caption(
+                f"Trying Yahoo **{psx_stock_symbol}.KA** first, "
+                f"then PSX Data Portal."
+            )
+    elif is_psx:
+        psx_label = st.sidebar.selectbox(
+            "PSX Index",
+            options=list(PSX_INDICES.keys()),
+            index=0,  # ALLSHR = KSE All Share
+            format_func=lambda s: f"{PSX_INDICES[s]} ({s})",
+            help="Live end-of-day data from the PSX Data Portal.",
+        )
+        psx_symbol = psx_label
+        st.sidebar.caption(f"Source: dps.psx.com.pk · symbol **{psx_symbol}**")
+    elif is_csv:
+        csv_label = st.sidebar.text_input(
+            "Instrument Name", value="KSE All Share Index",
+            help="Shown in the header. Purely a label.",
+        ).strip() or "Uploaded Instrument"
+        uploaded_file = st.sidebar.file_uploader(
+            "Historical CSV", type=["csv"],
+            help=(
+                "Investing.com: open the KSE All Share page → Historical Data → "
+                "'Download Data'. TradingView: chart → Export chart data. "
+                "Daily interval, 1 year or more."
+            ),
+        )
+        with st.sidebar.expander("📄 Expected CSV format"):
+            st.markdown(
+                "- **Investing.com:** `Date, Price, Open, High, Low, Vol., Change %`\n"
+                "- **TradingView:** `time, open, high, low, close, Volume`\n\n"
+                "Commas in numbers and K/M/B volume suffixes are handled "
+                "automatically. Only a Date + Close/Price column are strictly "
+                "required."
+            )
+    else:
+        ticker = st.sidebar.text_input(
+            "Ticker Symbol", value="NVDA",
+            help="e.g. NVDA, AAPL, MSFT, TSLA — or PSX stocks like HBL.KA, LUCK.KA",
+        ).strip().upper()
+
+    period_label = st.sidebar.selectbox(
+        "Lookback Period",
+        options=list(PERIOD_OPTIONS.keys()),
+        index=1,  # default 1 Year
+        disabled=is_csv,
+        help=(
+            "Applies to Yahoo and PSX Data Portal. "
+            "CSV mode uses the file's full range."
+        ),
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📐 Risk Parameters")
+
+    atr_mult = st.sidebar.slider(
+        "ATR Stop-Loss Multiplier", 1.0, 3.0, 1.5, 0.1,
+        help="Stop = S1 − (multiplier × ATR14)",
+    )
+    rr_tp1 = st.sidebar.slider(
+        "Risk:Reward for TP1", 1.0, 3.0, 1.5, 0.1,
+    )
+    rr_tp2 = st.sidebar.slider(
+        "Risk:Reward for TP2", 2.0, 5.0, 3.0, 0.1,
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(
+        "⚠️ Educational tool only. Not financial advice. "
+        "Levels are algorithmic estimates from historical data."
+    )
+
+    return {
+        "is_psx_stock": is_psx_stock,
+        "is_psx": is_psx,
+        "is_csv": is_csv,
+        "ticker": ticker,
+        "psx_symbol": psx_symbol,
+        "psx_stock_symbol": psx_stock_symbol,
+        "csv_label": csv_label,
+        "uploaded_file": uploaded_file,
+        "period": PERIOD_OPTIONS[period_label],
+        "period_label": period_label,
+        "atr_mult": atr_mult,
+        "rr_tp1": rr_tp1,
+        "rr_tp2": rr_tp2,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Main render
+# -----------------------------------------------------------------------------
+def render_header(name: str, ticker: str, plan: dict) -> None:
+    change = plan["daily_change"]
+    change_pct = plan["daily_change_pct"]
+    arrow = "▲" if change >= 0 else "▼"
+    change_color = "#00C853" if change >= 0 else "#D50000"
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.markdown(f"## {name} ({ticker})")
+        st.markdown(
+            f"<div style='font-size:1.6rem;font-weight:700;'>"
+            f"${plan['current_price']:,.2f} "
+            f"<span style='color:{change_color};font-size:1.1rem;'>"
+            f"{arrow} {change:+,.2f} ({change_pct:+.2f}%)</span></div>",
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown("<div style='text-align:right;padding-top:18px;'>", unsafe_allow_html=True)
+        st.markdown("**Market Bias**", unsafe_allow_html=True)
+        st.markdown(bias_badge(plan["bias"]), unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if plan["overbought"]:
+        st.warning(
+            f"RSI is {plan['rsi']:.1f} (> 70, overbought). Momentum entries are "
+            f"filtered out — favor waiting for a pullback toward S1/S2."
+        )
+
+
+def render_metrics(plan: dict) -> None:
+    price = plan["current_price"]
+    m = st.columns(6)
+
+    m[0].metric(
+        "Primary Entry (S1)", f"${plan['s1_entry']:,.2f}",
+        f"{pct_from_price(plan['s1_entry'], price):+.2f}%",
+        delta_color="off",
+    )
+    m[1].metric(
+        "Deep Entry (S2)", f"${plan['s2_entry']:,.2f}",
+        f"{pct_from_price(plan['s2_entry'], price):+.2f}%",
+        delta_color="off",
+    )
+    m[2].metric(
+        "Stop Loss (SL)", f"${plan['stop_loss']:,.2f}",
+        f"{pct_from_price(plan['stop_loss'], price):+.2f}%",
+        delta_color="off",
+    )
+    m[3].metric(
+        "Take Profit 1", f"${plan['tp1']:,.2f}",
+        f"{pct_from_price(plan['tp1'], price):+.2f}%",
+        delta_color="off",
+    )
+    m[4].metric(
+        "Take Profit 2", f"${plan['tp2']:,.2f}",
+        f"{pct_from_price(plan['tp2'], price):+.2f}%",
+        delta_color="off",
+    )
+    m[5].metric(
+        "R:R (TP1 / TP2)",
+        f"{plan['rr_tp1']:.1f} / {plan['rr_tp2']:.1f}",
+        f"ATR {plan['atr']:.2f}",
+        delta_color="off",
+    )
+
+
+def main() -> None:
+    st.title("📈 Quant Trade Levels")
+    st.caption(
+        "Daily-timeframe technical level engine — EMA trend bias, RSI/MACD "
+        "momentum filters, ATR-based stops and classic pivot confluence."
+    )
+
+    params = render_sidebar()
+
+    # --- Data acquisition, branched by source --------------------------------
+    if params["is_psx_stock"]:
+        sym = params["psx_stock_symbol"]
+        if not sym:
+            st.info("👈 Pick a PSX stock in the sidebar to begin.")
+            st.stop()
+        display_symbol = sym
+        try:
+            with st.spinner(f"Fetching {sym} (Yahoo .KA → PSX fallback)…"):
+                df = load_psx_stock(sym, params["period"])
+                names = load_psx_symbols()
+                name = names.get(sym, sym)
+        except ValueError as e:
+            st.error(f"❌ {e}")
+            st.stop()
+        except Exception as e:
+            st.error(f"❌ Unexpected error fetching '{sym}': {e}")
+            st.stop()
+    elif params["is_psx"]:
+        sym = params["psx_symbol"]
+        display_symbol = sym
+        try:
+            with st.spinner(f"Fetching {sym} from PSX Data Portal…"):
+                df = load_psx_data(sym, params["period"])
+                name = PSX_INDICES.get(sym, sym)
+        except ValueError as e:
+            st.error(f"❌ {e}")
+            st.stop()
+        except Exception as e:
+            st.error(f"❌ Unexpected error fetching '{sym}' from PSX: {e}")
+            st.stop()
+    elif params["is_csv"]:
+        if params["uploaded_file"] is None:
+            st.info(
+                "👈 Upload a KSE All Share Index CSV (exported from "
+                "Investing.com or TradingView) in the sidebar to begin."
+            )
+            st.stop()
+        display_symbol = "CSV"
+        try:
+            with st.spinner("Parsing uploaded CSV…"):
+                df = load_csv_data(params["uploaded_file"])
+                name = params["csv_label"]
+        except ValueError as e:
+            st.error(f"❌ {e}")
+            st.stop()
+        except Exception as e:
+            st.error(f"❌ Could not process the CSV: {e}")
+            st.stop()
+    else:
+        if not params["ticker"]:
+            st.info("👈 Enter a ticker symbol in the sidebar to begin.")
+            st.stop()
+        display_symbol = params["ticker"]
+        try:
+            with st.spinner(f"Fetching {params['ticker']} data…"):
+                df = load_price_data(params["ticker"], params["period"])
+                name = load_ticker_name(params["ticker"])
+        except ValueError as e:
+            st.error(f"❌ {e}")
+            st.stop()
+        except Exception as e:  # network / yfinance internals
+            st.error(
+                f"❌ Unexpected error fetching '{params['ticker']}': {e}\n\n"
+                f"Check the symbol, your connection, or try again shortly."
+            )
+            st.stop()
+
+    try:
+        df = add_indicators(df)
+        plan = compute_trade_plan(
+            df, params["atr_mult"], params["rr_tp1"], params["rr_tp2"]
+        )
+    except Exception as e:
+        st.error(f"❌ Failed to compute indicators/levels: {e}")
+        st.stop()
+
+    # Sanity guard: SL must sit below entry for a long setup.
+    if plan["risk"] <= 0:
+        st.warning(
+            "Computed stop loss is at or above the primary entry, so the long "
+            "setup is invalid at these parameters. Try a larger ATR multiplier "
+            "or a different lookback."
+        )
+
+    # --- Render --------------------------------------------------------------
+    render_header(name, display_symbol, plan)
+    st.markdown("---")
+    render_metrics(plan)
+    st.markdown("---")
+
+    st.plotly_chart(build_chart(df, plan, display_symbol), use_container_width=True)
+
+    st.markdown("### 🎯 Trade Execution Summary")
+    summary = build_summary_table(plan)
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    with st.expander("🔍 Indicator Snapshot & Pivot Points"):
+        piv = plan["pivots"]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Trend / Momentum**")
+            st.write(
+                pd.DataFrame(
+                    {
+                        "Indicator": ["EMA 20", "EMA 50", "RSI 14", "MACD Hist", "ATR 14"],
+                        "Value": [
+                            f"{plan['ema20']:.2f}",
+                            f"{plan['ema50']:.2f}",
+                            f"{plan['rsi']:.1f}",
+                            f"{plan['macd_hist']:.3f}",
+                            f"{plan['atr']:.2f}",
+                        ],
+                    }
+                ),
+            )
+        with c2:
+            st.markdown("**Classic Daily Pivots**")
+            st.write(
+                pd.DataFrame(
+                    {
+                        "Level": ["R2", "R1", "Pivot", "S1", "S2"],
+                        "Price": [
+                            f"{piv['R2']:.2f}",
+                            f"{piv['R1']:.2f}",
+                            f"{piv['P']:.2f}",
+                            f"{piv['S1']:.2f}",
+                            f"{piv['S2']:.2f}",
+                        ],
+                    }
+                ),
+            )
+
+    if params["is_psx_stock"]:
+        src = df.attrs.get("source", "yahoo")
+        data_src = (
+            "Yahoo Finance (.KA, OHLC)" if src == "yahoo"
+            else "PSX Data Portal (close-only)"
+        )
+    elif params["is_psx"]:
+        data_src = "PSX Data Portal (dps.psx.com.pk)"
+    elif params["is_csv"]:
+        data_src = "uploaded CSV"
+    else:
+        data_src = "yfinance"
+    st.caption(
+        f"Data via {data_src} · {params['period_label']} lookback · "
+        f"Last bar: {df.index[-1].date()} · Generated {_dt.date.today()}"
+    )
+
+
+if __name__ == "__main__":
+    main()
