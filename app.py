@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
@@ -851,6 +852,10 @@ Return ONLY one valid JSON object (no markdown/code fences) shaped EXACTLY:
   "time_projections": [
     {"wave":"Wave 3","basis":"1.000 / 1.618 x Wave 1 duration","window":"e.g. 'Late Q3 - Early Q4 2027'","detail":"periods compared"}
   ],
+  "wave_timeline": [
+    {"wave":"Primary 1","start":"YYYY-MM-DD","end":"YYYY-MM-DD","kind":"elapsed","fib":""},
+    {"wave":"Int (3)","start":"YYYY-MM-DD","end":"YYYY-MM-DD","kind":"projected","fib":"1.618 x (1) time"}
+  ],
   "time_alternation":"if W2 was fast, expect W4 drawn-out (or vice-versa) - state it",
   "completion_window":"estimated window for completing the current primary wave",
 
@@ -878,6 +883,10 @@ Data rules:
   valid, or set structure_type to corrective/unclear.
 - price_projections & targets carry EXACT dollar figures; invalidation_price and
   retracement_zone are real numbers; projected_path dates are in the FUTURE.
+- wave_timeline: give start/end dates for the key waves as a Gantt. 'elapsed'
+  waves use the real pivot dates; 'projected' waves are in the FUTURE with dated
+  start/end (contiguous with the last elapsed wave). Cover the current + next few
+  waves so the emerging structure's expected timeline is visible.
 """
 
 
@@ -973,6 +982,80 @@ def deep_elliott_analysis(
             "Claude Sonnet 5 (faster, lighter reasoning) in the sidebar."
         )
     return _parse_analysis_json(text)
+
+
+def build_wave_timeline_chart(data: dict, close: pd.Series) -> "go.Figure | None":
+    """Gantt-style timeline of the wave count: elapsed waves vs the projected
+    (expected) waves shaping up, with a 'now' divider and Fibonacci-time labels."""
+    rows = []
+    for w in data.get("wave_timeline") or []:
+        s = pd.to_datetime(w.get("start"), errors="coerce")
+        e = pd.to_datetime(w.get("end"), errors="coerce")
+        if pd.isna(s) or pd.isna(e):
+            continue
+        if e <= s:
+            e = s + pd.Timedelta(days=7)
+        kind = "Projected" if str(w.get("kind", "")).lower().startswith("proj") else "Elapsed"
+        rows.append({"Wave": str(w.get("wave", "")), "start": s, "end": e,
+                     "Phase": kind, "fib": w.get("fib", "")})
+
+    # Fallback: derive from pivots + projected path if the model omitted the field.
+    if not rows:
+        cp = [p for p in (data.get("completed_pivots") or []) if p.get("date")]
+        cp = sorted(cp, key=lambda p: pd.to_datetime(p.get("date"), errors="coerce"))
+        cp = [p for p in cp if not pd.isna(pd.to_datetime(p.get("date"), errors="coerce"))]
+        for i in range(1, len(cp)):
+            s = pd.to_datetime(cp[i - 1]["date"], errors="coerce")
+            e = pd.to_datetime(cp[i]["date"], errors="coerce")
+            if e <= s:
+                continue
+            rows.append({"Wave": f"Wave {cp[i].get('label', i)}", "start": s,
+                         "end": e, "Phase": "Elapsed", "fib": ""})
+        prev = pd.to_datetime(cp[-1]["date"], errors="coerce") if cp else close.index[-1]
+        for p in data.get("projected_path") or []:
+            e = pd.to_datetime(p.get("date"), errors="coerce")
+            if pd.isna(e):
+                continue
+            s = prev
+            if e <= s:
+                e = s + pd.Timedelta(days=14)
+            rows.append({"Wave": str(p.get("label", "")), "start": s, "end": e,
+                         "Phase": "Projected", "fib": ""})
+            prev = e
+
+    if len(rows) < 2:
+        return None
+
+    df = pd.DataFrame(rows).sort_values("start").reset_index(drop=True)
+    order = list(dict.fromkeys(df["Wave"].tolist()))  # chronological, de-duped
+    fig = px.timeline(
+        df, x_start="start", x_end="end", y="Wave", color="Phase",
+        color_discrete_map={"Elapsed": "#4C78D8", "Projected": "#E4572E"},
+        category_orders={"Wave": order}, hover_data=["fib"],
+    )
+    fig.update_yaxes(autorange="reversed", title="")
+    fig.update_traces(marker_line_width=0, opacity=0.9)
+    # Dotted borders for projected bars to read as "expected".
+    for tr in fig.data:
+        if tr.name == "Projected":
+            tr.marker.line = dict(color="#E4572E", width=1.5)
+            tr.marker.pattern = dict(shape="/", fgcolor="#E4572E", bgcolor="#fdecea")
+
+    now = close.index[-1]
+    fig.add_vline(x=now, line=dict(color="#8892a0", width=1.4, dash="dot"))
+    fig.add_annotation(x=now, y=1.0, yref="paper", text="now", showarrow=False,
+                       xanchor="left", font=dict(color="#8892a0", size=11))
+    fig.update_layout(
+        template="plotly_white",
+        height=max(240, 46 * len(order) + 90),
+        margin=dict(l=10, r=20, t=44, b=10),
+        title=dict(text="Expected wave timeline — elapsed vs projected", x=0.01,
+                   font=dict(size=14)),
+        legend=dict(orientation="h", y=1.06, x=0, title=""),
+        xaxis=dict(title=""),
+        dragmode=False,
+    )
+    return fig
 
 
 def build_ew_report_chart(close: pd.Series, data: dict) -> "go.Figure":
@@ -2118,8 +2201,16 @@ def _render_ew_report(bundle: dict) -> None:
     # === 4. TIME PROJECTIONS =================================================
     tp = data.get("time_projections") or []
     tw = data.get("time_windows") or []
-    if tp or tw or data.get("completion_window"):
+    timeline_fig = build_wave_timeline_chart(data, close)
+    if tp or tw or data.get("completion_window") or timeline_fig is not None:
         st.markdown("### 4 · Time Projections (Fibonacci Time Zones)")
+        if timeline_fig is not None:
+            st.plotly_chart(timeline_fig, use_container_width=True,
+                            config={"displayModeBar": False})
+            st.caption(
+                "Blue = elapsed waves · red hatched = the expected timeline of the "
+                "emerging wave count; the dotted line marks now."
+            )
         if tp:
             st.dataframe(
                 pd.DataFrame([
