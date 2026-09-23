@@ -377,8 +377,8 @@ def load_psx_stock(symbol: str, period: str = "1y") -> pd.DataFrame:
 # AI chart-image analysis (Anthropic Claude vision)
 # -----------------------------------------------------------------------------
 AI_MODELS = {
-    "Claude Opus 5 (best reasoning)": "claude-opus-5",
     "Claude Sonnet 5 (faster / cheaper)": "claude-sonnet-5",
+    "Claude Opus 5 (best reasoning)": "claude-opus-5",
 }
 
 _ANALYSIS_SCHEMA_HINT = """
@@ -420,17 +420,22 @@ outside the JSON) with EXACTLY this shape:
     ],
     "invalidation": "price level/condition that invalidates this count",
     "targets": "projected target zone(s) with Fibonacci reasoning",
-    "wave_points": [{"label": "0/1/2/3/4/5 or A/B/C", "x": 0.0, "y": 0.0}],
-    "projected_points": [{"label": "string", "x": 0.0, "y": 0.0}]
+    "wave_points": [{"label": "0/1/2/3/4/5 or A/B/C", "x": 0.0, "y": 0.0, "price": "optional string"}],
+    "projected_points": [{"label": "string", "x": 0.0, "y": 0.0, "price": "optional string"}]
   }
 }
 
-For wave_points and projected_points: x is normalized time from 0.0 (left/oldest
-edge of the chart) to 1.0 (right/newest edge); y is the price at that pivot read
-from the chart's axis (use real price numbers when the axis is legible, otherwise
-a consistent relative scale). wave_points trace the count that has ALREADY formed
-(left to right); projected_points continue the dotted expected path into the
-future (x should exceed the last wave_points x, up to ~1.3).
+CRITICAL — wave_points and projected_points coordinates are NORMALIZED IMAGE
+FRACTIONS so they can be drawn directly on top of the uploaded image:
+  • "x" = 0.0 at the LEFT edge of the chart image, 1.0 at the RIGHT edge.
+  • "y" = 0.0 at the TOP edge of the image, 1.0 at the BOTTOM edge.
+    (So a swing HIGH has a SMALL y, a swing LOW has a LARGE y.)
+Place each pivot as accurately as you can on the actual candles/price line in the
+image. wave_points trace the count that has ALREADY formed, left to right, ending
+at the most recent pivot. projected_points continue the EXPECTED future path to
+the right of the last completed pivot (x increasing, up to ~1.0); their y values
+reflect the expected swing highs/lows. Include "price" as the axis price at that
+pivot when the axis is legible.
 """
 
 _ANALYSIS_SYSTEM = (
@@ -529,22 +534,35 @@ def _parse_analysis_json(text: str) -> dict:
         raise ValueError(f"Could not parse the model's JSON ({e}).") from e
 
 
-def build_wave_projection_chart(elliott: dict) -> "go.Figure | None":
-    """Schematic solid (completed) + dotted (projected) Elliott Wave path."""
+def build_wave_overlay_chart(
+    image_bytes: bytes, media_type: str, elliott: dict
+) -> "go.Figure | None":
+    """Draw the Elliott Wave labels + dotted projected path directly ON TOP of
+    the uploaded chart image, using the model's normalized image coordinates."""
     pts = [p for p in (elliott.get("wave_points") or []) if _has_xy(p)]
     proj = [p for p in (elliott.get("projected_points") or []) if _has_xy(p)]
     if len(pts) < 2:
         return None
 
+    b64 = _b64.standard_b64encode(image_bytes).decode("utf-8")
     fig = go.Figure()
+    # Uploaded chart as the background; axes span 0..1 with a top-left origin.
+    fig.add_layout_image(
+        dict(
+            source=f"data:{media_type};base64,{b64}",
+            xref="x", yref="y", x=0, y=0, sizex=1, sizey=1,
+            xanchor="left", yanchor="top", sizing="stretch", layer="below",
+        )
+    )
     fig.add_trace(
         go.Scatter(
             x=[p["x"] for p in pts], y=[p["y"] for p in pts],
             mode="lines+markers+text",
             text=[str(p.get("label", "")) for p in pts],
             textposition="top center",
-            line=dict(color="#26A69A", width=2.4),
-            marker=dict(size=8, color="#26A69A"),
+            textfont=dict(color="#00E5FF", size=14),
+            line=dict(color="#00E5FF", width=2.4),
+            marker=dict(size=9, color="#00E5FF"),
             name="Completed waves",
         )
     )
@@ -557,20 +575,22 @@ def build_wave_projection_chart(elliott: dict) -> "go.Figure | None":
                 x=bridge_x, y=bridge_y,
                 mode="lines+markers+text",
                 text=labels, textposition="bottom center",
-                line=dict(color="#AA00FF", width=2.4, dash="dot"),
-                marker=dict(size=8, color="#AA00FF"),
+                textfont=dict(color="#FFD54F", size=14),
+                line=dict(color="#FFD54F", width=2.6, dash="dot"),
+                marker=dict(size=9, color="#FFD54F"),
                 name="Projected path (expected)",
             )
         )
+    fig.update_xaxes(range=[0, 1], visible=False, fixedrange=True)
+    fig.update_yaxes(range=[1, 0], visible=False, fixedrange=True)  # top-left origin
     fig.update_layout(
-        template="plotly_dark", height=420,
-        margin=dict(l=10, r=10, t=40, b=10),
-        title=dict(text="Elliott Wave — completed (solid) vs projected (dotted)",
-                   x=0.01, font=dict(size=14)),
-        legend=dict(orientation="h", y=1.04, x=0, font=dict(size=10)),
+        height=540, margin=dict(l=6, r=6, t=38, b=6),
+        title=dict(
+            text="Elliott Wave overlay — completed (cyan) vs projected (dotted amber)",
+            x=0.01, font=dict(size=13),
+        ),
+        legend=dict(orientation="h", y=1.03, x=0, font=dict(size=10)),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(title="time →", showticklabels=False),
-        yaxis=dict(title="price"),
         dragmode=False,
     )
     return fig
@@ -1011,6 +1031,9 @@ def render_sidebar() -> dict:
         api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
     except Exception:
         api_key = ""
+    # Ignore the shipped placeholder so the input still shows until a real key is set.
+    if api_key and "REPLACE" in api_key:
+        api_key = ""
     key_from_secrets = bool(api_key)
     if key_from_secrets:
         st.sidebar.caption("🔑 Using API key from Streamlit secrets.")
@@ -1278,12 +1301,14 @@ def render_image_analysis(params: dict) -> None:
                 return
         data = cache.get(img_key)
         if data:
-            _render_analysis_tabs(data, params)
+            _render_analysis_tabs(data, params, img_bytes, media_type)
     else:
         st.caption("Click **Analyze** to run the vision analysis on this image.")
 
 
-def _render_analysis_tabs(data: dict, params: dict) -> None:
+def _render_analysis_tabs(
+    data: dict, params: dict, img_bytes: bytes, media_type: str
+) -> None:
     meta = (
         f"Instrument: **{data.get('instrument_guess', 'Unknown')}** · "
         f"Timeframe: **{data.get('timeframe_guess', 'Unknown')}**"
@@ -1372,12 +1397,16 @@ def _render_analysis_tabs(data: dict, params: dict) -> None:
         st.markdown(f"**Wave degree:** {ew.get('degree', '—')}")
         st.write(ew.get("narrative", ""))
 
-        fig = build_wave_projection_chart(ew)
+        fig = build_wave_overlay_chart(img_bytes, media_type, ew)
         if fig is not None:
             st.plotly_chart(fig, use_container_width=True,
                             config={"displayModeBar": False})
+            st.caption(
+                "Cyan = completed wave count drawn on your chart; dotted amber = "
+                "expected next waves. Positions are the model's best visual read."
+            )
         else:
-            st.caption("No numeric wave pivots were returned to plot a path.")
+            st.caption("No wave pivots were returned to draw an overlay.")
 
         c1, c2 = st.columns(2)
         with c1:
