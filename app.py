@@ -791,48 +791,93 @@ def fetch_ew_history_ticker(ticker: str, timeframe: str):
     )
 
 
+_DEEP_EW_SYSTEM = (
+    "You are an expert Technical Analyst and a Master Elliott Wave Practitioner "
+    "working strictly in the tradition of Ralph Nelson Elliott. You produce "
+    "comprehensive, strictly rule-based wave analysis for educational purposes "
+    "(general technical education about historical price data, not personalized "
+    "financial advice).\n\n"
+    "THE THREE UNBREAKABLE RULES (never violate; if a labelling would violate one, "
+    "RELABEL until compliant):\n"
+    "  R1: Wave 2 never retraces more than 100% of Wave 1.\n"
+    "  R2: Wave 3 is never the shortest of Waves 1, 3 and 5.\n"
+    "  R3: Wave 4 never enters the price territory of Wave 1 (only exception: a "
+    "diagonal triangle, which you must explicitly justify if invoked).\n"
+    "GUIDELINE — Alternation: Wave 2 and Wave 4 alternate in complexity/shape/"
+    "duration (a sharp Wave 2 zigzag pairs with a sideways Wave 4 flat/triangle, "
+    "and vice-versa). Also apply channelling and Fibonacci relationships.\n\n"
+    "You analyse the ACTUAL swing pivots supplied, compute Fibonacci price and time "
+    "relationships from them, and give exact dollar targets and dated time windows. "
+    "You always state a precise invalidation price and a concrete alternative count. "
+    "If the data does not form a clean rule-compliant motive structure, you say so "
+    "(structure_type = corrective/unclear) rather than forcing an invalid count. "
+    "You output STRICTLY the requested JSON object and nothing else."
+)
+
 _DEEP_EW_SCHEMA = """
 Return ONLY one valid JSON object (no markdown/code fences) shaped EXACTLY:
 
 {
-  "position": "current wave position, e.g. 'Minor B of Int (2) of Primary 3 of Cycle B'",
-  "current_price": "string like '$1.94'",
-  "cycle_decline_pct": "string like '-97.92%' (peak-to-trough of the visible history), or ''",
   "structure_type": "impulse | corrective | diagonal | unclear",
-  "cards": [{"label":"POSITION","value":"...","sub":"..."}],  // 4-5 concise status cards
-  "narrative": ["professional paragraph 1", "paragraph 2", "..."],
+  "current_price": "string like '$1.94'",
+  "cycle_decline_pct": "peak-to-trough of the visible history, e.g. '-97.92%', or ''",
+
+  "rule_verification": {
+    "rule1": {"statement":"Wave 2 never retraces >100% of Wave 1","status":"Pass|Fail|N/A","detail":"the ACTUAL % retrace with prices"},
+    "rule2": {"statement":"Wave 3 is never the shortest of 1/3/5","status":"Pass|Fail|N/A","detail":"the ACTUAL W1/W3/W5 lengths"},
+    "rule3": {"statement":"Wave 4 never enters Wave 1 territory","status":"Pass|Fail|N/A","detail":"W4 extreme vs W1 extreme, clearance amount"},
+    "alternation": {"status":"Holds|Violated|N/A","detail":"how W2 and W4 alternate in form/depth/time"}
+  },
   "rule_table": [
-    {"sequence":"Primary 1 (1.105 -> 2.700)",
-     "rule1":"e.g. '92.7% PASS' (W2 retrace of W1)",
-     "rule2":"e.g. '$0.615 / $1.280 / $0.725 - w3 longest PASS' (W1/W3/W5 lengths, W3 not shortest)",
-     "rule3":"e.g. 'w4 low 1.975 vs w1 high 1.720 - clears $0.255 PASS' (W4 vs W1 overlap)",
-     "alternation":"short note"}
+    {"sequence":"e.g. 'Primary 1 (1.105 -> 2.700)'","rule1":"'92.7% PASS'","rule2":"'$0.615/$1.280/$0.725 - w3 longest PASS'","rule3":"'w4 1.975 vs w1 1.720 - clears $0.255 PASS'","alternation":"short note"}
   ],
-  "completed_pivots": [
-    {"date":"YYYY-MM-DD","price": 0.0, "label":"1","degree":"Primary|Intermediate|Cycle|Minor"}
+
+  "macro_context": {
+    "grand_supercycle":"macro trend at Grand Supercycle/Supercycle degree",
+    "cycle":"Cycle degree read",
+    "primary":"Primary degree — 5-wave motive or A-B-C corrective, which wave",
+    "intermediate_minor":"Intermediate/Minor/Minute degree — the exact current sub-wave",
+    "current_position":"one line, e.g. 'Minute (v) of Minor 3 of Primary 5 of Cycle I'"
+  },
+
+  "price_projections": [
+    {"wave":"Wave 2 / B","method":"0.500 or 0.618 retrace of Wave 1/A","target":"$X.XX (or $X.XX-$Y.YY)","confluence":"what confirms it"},
+    {"wave":"Wave 3","method":"1.618 or 2.618 extension of Wave 1","target":"$...","confluence":"..."},
+    {"wave":"Wave 4","method":"0.382 retrace of Wave 3","target":"$...","confluence":"..."},
+    {"wave":"Wave 5","method":"= Wave 1, or 0.618 ext of net 1->3","target":"$...","confluence":"..."}
   ],
-  "projected_path": [
-    {"date":"YYYY-MM-DD","price": 0.0, "label":"(3) $3.78"}
+  "immediate_sequence":"exact dollar amounts for the NEXT immediate sequence, in prose",
+
+  "time_projections": [
+    {"wave":"Wave 3","basis":"1.000 / 1.618 x Wave 1 duration","window":"e.g. 'Late Q3 - Early Q4 2027'","detail":"periods compared"}
   ],
+  "time_alternation":"if W2 was fast, expect W4 drawn-out (or vice-versa) - state it",
+  "completion_window":"estimated window for completing the current primary wave",
+
   "invalidation_price": 0.0,
   "invalidation_label":"e.g. 'INVALID $1.3800'",
+  "invalidation_note":"exact price TO THE PENNY where the primary count fails, and why",
+  "alternative_count": {"trigger":"e.g. 'if price < $1.38'","description":"the most probable alternative, e.g. a complex W-X-Y correction"},
+
+  "cards": [{"label":"POSITION","value":"...","sub":"..."}],
+  "narrative": ["professional paragraph 1", "paragraph 2", "..."],
+  "completed_pivots": [
+    {"date":"YYYY-MM-DD","price": 0.0, "label":"1","degree":"Cycle|Primary|Intermediate|Minor"}
+  ],
+  "projected_path": [ {"date":"YYYY-MM-DD","price": 0.0, "label":"(3) $3.78"} ],
   "retracement_zone": {"low": 0.0, "high": 0.0, "label":"0.618-0.786 grid"},
-  "targets": [{"name":"Int (2) target","price":"$1.8384","detail":"0.618 - wk 14 Sep low was $1.835"}],
+  "targets": [{"name":"Int (2) target","price":"$1.8384","detail":"0.618 - basis"}],
   "time_windows": [{"wave":"Int (3)","window":"Dec 2026 - Mar 2027","fib":"2.618 x (1) time"}],
   "use_log_scale": true
 }
 
-Rules for the data you output:
-- completed_pivots MUST use the ACTUAL provided pivot dates & prices (you assign
-  the wave labels/degrees to them). Include the higher-degree labels on the pivots
-  that mark degree boundaries.
-- projected_path dates are in the FUTURE (after the last pivot date); prices are
-  your Fibonacci-derived targets. Give 3-6 points tracing the expected path.
-- invalidation_price and retracement_zone are real price numbers.
-- Compute every ratio in rule_table from the actual pivot prices; verify the three
-  inviolable rules (W2<=100% W1; W3 not shortest of 1/3/5; W4 no overlap with W1)
-  AND directional consistency. If a labelling violates a rule, RELABEL until valid.
-  If no clean impulse exists, set structure_type to 'corrective'/'unclear' and say so.
+Data rules:
+- Use the ACTUAL provided pivot dates & prices for completed_pivots; assign the
+  wave labels/degrees. Compute every ratio in rule_verification / rule_table from
+  those real prices. Verify R1/R2/R3 + alternation; if any fails, RELABEL until
+  valid, or set structure_type to corrective/unclear.
+- price_projections & targets carry EXACT dollar figures; invalidation_price and
+  retracement_zone are real numbers; projected_path dates are in the FUTURE.
 """
 
 
@@ -858,17 +903,24 @@ def deep_elliott_analysis(
     pivot_block = "\n".join(lines)
 
     task = (
-        f"For educational technical-analysis practice, produce a rigorous, "
-        f"textbook-compliant, MULTI-DEGREE Elliott Wave analysis (Cycle -> Primary "
-        f"-> Intermediate, adding Minor where useful) for {name} ({symbol}) on the "
-        f"{timeframe} timeframe. This is general chart education about historical "
-        f"price data, not personalized financial advice.\n\n"
+        f"Produce a comprehensive, strictly rule-based Elliott Wave analysis for "
+        f"{name} ({symbol}) on the {timeframe} timeframe, for educational purposes. "
         f"History: {n_bars} {timeframe.lower()} bars. Latest price: {last_price:.4f}.\n"
         f"Actual swing pivots (date: price), oldest first:\n{pivot_block}\n\n"
-        f"Assign wave labels to these real pivots, compute the Fibonacci price and "
-        f"time relationships from them, verify all core Elliott Wave rules with "
-        f"actual numbers, give price targets, a projected future path, and the "
-        f"invalidation level.\n\n" + _DEEP_EW_SCHEMA
+        f"Deliver ALL of the following, computed from these real pivots:\n"
+        f"1. STRICT RULE VERIFICATION — explicitly confirm R1 (W2 < 100% W1), "
+        f"R2 (W3 not shortest of 1/3/5), R3 (W4 outside W1 territory; justify any "
+        f"diagonal), and the Alternation guideline, each with actual numbers.\n"
+        f"2. CURRENT WAVE COUNT & MACRO CONTEXT — Grand Supercycle/Cycle down to "
+        f"the exact current Intermediate/Minor/Minute sub-wave.\n"
+        f"3. PRICE PROJECTIONS — Fibonacci retracements/extensions with EXACT dollar "
+        f"targets for Wave 2/B (0.5/0.618), Wave 3 (1.618/2.618), Wave 4 (0.382), "
+        f"Wave 5 (=W1 or 0.618 of net 1->3), plus the next immediate sequence.\n"
+        f"4. TIME PROJECTIONS — Fibonacci time zones: project wave durations vs past "
+        f"waves, apply time alternation, give a dated completion window.\n"
+        f"5. INVALIDATION & ALTERNATIVE COUNT — the exact invalidation price to the "
+        f"penny, and the most probable alternative count if it breaks.\n\n"
+        + _DEEP_EW_SCHEMA
     )
 
     def _run(effort: str, max_tokens: int):
@@ -876,7 +928,7 @@ def deep_elliott_analysis(
         # budget before the JSON is written, and stream so the large budget does
         # not hit HTTP timeouts.
         kwargs = dict(
-            model=model, max_tokens=max_tokens, system=_ANALYSIS_SYSTEM,
+            model=model, max_tokens=max_tokens, system=_DEEP_EW_SYSTEM,
             messages=[{"role": "user", "content": task}],
             output_config={"effort": effort},
         )
@@ -1958,6 +2010,10 @@ def render_deep_ew(params: dict) -> None:
         st.caption("Pick a timeframe and click **Generate** to build the report.")
 
 
+_RULE_ICON = {"pass": "✅", "holds": "✅", "fail": "❌", "violated": "❌",
+              "n/a": "➖", "": ""}
+
+
 def _render_ew_report(bundle: dict) -> None:
     data = bundle["data"]
     close = bundle["close"]
@@ -1966,8 +2022,10 @@ def _render_ew_report(bundle: dict) -> None:
         f"### {bundle['name']} ({bundle['symbol']}) — {bundle['n']} bars · "
         f"last {data.get('current_price', f'{float(close.iloc[-1]):,.2f}')}"
     )
+
+    mc = data.get("macro_context", {}) or {}
     top = st.columns(3)
-    top[0].markdown(f"**Position:** {data.get('position', '—')}")
+    top[0].markdown(f"**Current position:** {mc.get('current_position', data.get('position', '—'))}")
     top[1].markdown(f"**Structure:** {data.get('structure_type', '—')}")
     top[2].markdown(f"**Cycle decline:** {data.get('cycle_decline_pct', '—')}")
 
@@ -1991,61 +2049,123 @@ def _render_ew_report(bundle: dict) -> None:
         config={"displayModeBar": False},
     )
 
-    # Rule verification table
+    # === 1. STRICT RULE VERIFICATION =========================================
+    st.markdown("### 1 · Strict Rule Verification")
+    rv = data.get("rule_verification", {}) or {}
+    if rv:
+        order = [("rule1", "Rule 1 — Wave 2 ≤ 100% of Wave 1"),
+                 ("rule2", "Rule 2 — Wave 3 not the shortest"),
+                 ("rule3", "Rule 3 — Wave 4 clear of Wave 1"),
+                 ("alternation", "Guideline — Alternation of W2/W4")]
+        rows = []
+        for key, title in order:
+            item = rv.get(key, {}) or {}
+            status = str(item.get("status", ""))
+            icon = _RULE_ICON.get(status.lower(), "")
+            rows.append({"Check": title, "Result": f"{icon} {status}".strip(),
+                         "Detail": item.get("detail", "")})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     rt = data.get("rule_table") or []
     if rt:
-        st.markdown("#### Rule verification — motive sequences")
-        st.dataframe(
-            pd.DataFrame([
-                {
-                    "Sequence": r.get("sequence", ""),
-                    "Rule 1 — W2 ≤ 100% W1": r.get("rule1", ""),
-                    "Rule 2 — W3 not shortest": r.get("rule2", ""),
-                    "Rule 3 — W4 clear of W1": r.get("rule3", ""),
-                    "Alternation": r.get("alternation", ""),
-                }
-                for r in rt
-            ]),
-            use_container_width=True, hide_index=True,
-        )
-
-    # Targets and time windows
-    cols = st.columns(2)
-    with cols[0]:
-        tg = data.get("targets") or []
-        if tg:
-            st.markdown("#### Price targets")
+        with st.expander("Per-sequence rule verification (all motive sequences)"):
             st.dataframe(
                 pd.DataFrame([
-                    {"Target": t.get("name", ""), "Price": t.get("price", ""),
-                     "Basis": t.get("detail", "")}
-                    for t in tg
+                    {"Sequence": r.get("sequence", ""),
+                     "Rule 1": r.get("rule1", ""), "Rule 2": r.get("rule2", ""),
+                     "Rule 3": r.get("rule3", ""), "Alternation": r.get("alternation", "")}
+                    for r in rt
                 ]),
                 use_container_width=True, hide_index=True,
             )
-    with cols[1]:
-        tw = data.get("time_windows") or []
-        if tw:
-            st.markdown("#### Fibonacci time windows")
+
+    # === 2. CURRENT WAVE COUNT & MACRO CONTEXT ===============================
+    if mc:
+        st.markdown("### 2 · Current Wave Count & Macro Context")
+        st.markdown(
+            f"- **Grand Supercycle / Supercycle:** {mc.get('grand_supercycle', '—')}\n"
+            f"- **Cycle degree:** {mc.get('cycle', '—')}\n"
+            f"- **Primary degree:** {mc.get('primary', '—')}\n"
+            f"- **Intermediate / Minor / Minute:** {mc.get('intermediate_minor', '—')}\n"
+            f"- **Exact current position:** {mc.get('current_position', '—')}"
+        )
+
+    # === 3. PRICE PROJECTIONS ================================================
+    pp = data.get("price_projections") or []
+    tg = data.get("targets") or []
+    if pp or tg:
+        st.markdown("### 3 · Price Projections (Fibonacci Confluence)")
+        if pp:
+            st.dataframe(
+                pd.DataFrame([
+                    {"Wave": p.get("wave", ""), "Method": p.get("method", ""),
+                     "Target ($)": p.get("target", ""), "Confluence": p.get("confluence", "")}
+                    for p in pp
+                ]),
+                use_container_width=True, hide_index=True,
+            )
+        if data.get("immediate_sequence"):
+            st.info(f"**Next immediate sequence:** {data['immediate_sequence']}")
+        if tg:
+            with st.expander("Key target levels"):
+                st.dataframe(
+                    pd.DataFrame([
+                        {"Target": t.get("name", ""), "Price": t.get("price", ""),
+                         "Basis": t.get("detail", "")} for t in tg
+                    ]),
+                    use_container_width=True, hide_index=True,
+                )
+
+    # === 4. TIME PROJECTIONS =================================================
+    tp = data.get("time_projections") or []
+    tw = data.get("time_windows") or []
+    if tp or tw or data.get("completion_window"):
+        st.markdown("### 4 · Time Projections (Fibonacci Time Zones)")
+        if tp:
+            st.dataframe(
+                pd.DataFrame([
+                    {"Wave": t.get("wave", ""), "Basis": t.get("basis", ""),
+                     "Window": t.get("window", ""), "Detail": t.get("detail", "")}
+                    for t in tp
+                ]),
+                use_container_width=True, hide_index=True,
+            )
+        elif tw:
             st.dataframe(
                 pd.DataFrame([
                     {"Wave": w.get("wave", ""), "Window": w.get("window", ""),
-                     "Fib": w.get("fib", "")}
-                    for w in tw
+                     "Fib": w.get("fib", "")} for w in tw
                 ]),
                 use_container_width=True, hide_index=True,
             )
+        if data.get("time_alternation"):
+            st.markdown(f"- **Time alternation:** {data['time_alternation']}")
+        if data.get("completion_window"):
+            st.markdown(f"- **Current primary wave completes:** {data['completion_window']}")
+
+    # === 5. INVALIDATION & ALTERNATIVE COUNT =================================
+    st.markdown("### 5 · Invalidation Level & Alternative Count")
+    inv_label = data.get("invalidation_label") or (
+        f"${data.get('invalidation_price')}" if data.get("invalidation_price") else "—")
+    st.markdown(f"- 🚫 **Primary invalidation:** {inv_label}")
+    if data.get("invalidation_note"):
+        st.markdown(f"  - {data['invalidation_note']}")
+    alt = data.get("alternative_count", {}) or {}
+    if alt:
+        st.markdown(
+            f"- 🔀 **Alternative count** ({alt.get('trigger', 'if invalidated')}): "
+            f"{alt.get('description', '—')}"
+        )
 
     # Narrative
     narr = data.get("narrative") or []
     if narr:
-        st.markdown("#### Analysis")
+        st.markdown("### Analyst commentary")
         for para in narr:
             st.write(para)
 
     st.caption(
-        "Multi-degree AI Elliott Wave read for education only — not financial "
-        "advice. Wave counts are interpretive; verify independently."
+        "Master-practitioner AI Elliott Wave analysis for education only — not "
+        "financial advice. Wave counts are probabilistic; verify independently."
     )
 
 
