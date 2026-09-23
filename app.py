@@ -1028,32 +1028,75 @@ def build_wave_timeline_chart(data: dict, close: pd.Series) -> "go.Figure | None
 
     df = pd.DataFrame(rows).sort_values("start").reset_index(drop=True)
     order = list(dict.fromkeys(df["Wave"].tolist()))  # chronological, de-duped
+
+    # Duration label unit from the series cadence (weekly vs daily).
+    try:
+        step = float(close.index.to_series().diff().dt.days.median())
+    except Exception:
+        step = 7.0
+    weekly = (step or 7.0) >= 5
+
+    def _dur(s, e):
+        d = max((e - s).days, 1)
+        return f"{round(d / 7)} wks" if weekly else f"{d} d"
+
+    C_ELAPSED, C_PROJ = "#3B7DD8", "#F0883E"
     fig = px.timeline(
         df, x_start="start", x_end="end", y="Wave", color="Phase",
-        color_discrete_map={"Elapsed": "#4C78D8", "Projected": "#E4572E"},
+        color_discrete_map={"Elapsed": C_ELAPSED, "Projected": C_PROJ},
         category_orders={"Wave": order}, hover_data=["fib"],
     )
-    fig.update_yaxes(autorange="reversed", title="")
-    fig.update_traces(marker_line_width=0, opacity=0.9)
-    # Dotted borders for projected bars to read as "expected".
+    fig.update_yaxes(
+        autorange="reversed", title="", showgrid=False,
+        tickfont=dict(size=12, color="#2b2f36"),
+    )
+    fig.update_traces(marker_line_width=0, opacity=0.95, width=0.62)
+    try:
+        fig.update_traces(marker=dict(cornerradius=7))
+    except Exception:
+        pass
     for tr in fig.data:
         if tr.name == "Projected":
-            tr.marker.line = dict(color="#E4572E", width=1.5)
-            tr.marker.pattern = dict(shape="/", fgcolor="#E4572E", bgcolor="#fdecea")
+            tr.marker.pattern = dict(shape="/", fgcolor="#fff",
+                                     bgcolor=C_PROJ, size=7, solidity=0.35)
 
     now = close.index[-1]
-    fig.add_vline(x=now, line=dict(color="#8892a0", width=1.4, dash="dot"))
-    fig.add_annotation(x=now, y=1.0, yref="paper", text="now", showarrow=False,
-                       xanchor="left", font=dict(color="#8892a0", size=11))
+    end_max = df["end"].max()
+    # Shade + label the future zone.
+    if end_max > now:
+        fig.add_vrect(x0=now, x1=end_max, fillcolor="#F0883E", opacity=0.06,
+                      line_width=0, layer="below")
+    fig.add_vline(x=now, line=dict(color="#94a3b8", width=1.4, dash="dot"))
+    fig.add_annotation(x=now, y=1.02, yref="paper", text="now  ▸ future",
+                       showarrow=False, xanchor="left",
+                       font=dict(color="#94a3b8", size=11))
+
+    # Duration (and fib) labels at the end of each bar.
+    for _, r in df.iterrows():
+        txt = _dur(r["start"], r["end"])
+        if r.get("fib"):
+            txt += f"  ·  {r['fib']}"
+        fig.add_annotation(
+            x=r["end"], y=r["Wave"], text=txt, showarrow=False,
+            xanchor="left", xshift=8, yanchor="middle",
+            font=dict(size=11, color=("#b45309" if r["Phase"] == "Projected"
+                                      else "#334155")),
+        )
+
+    fig.update_xaxes(
+        title="", showgrid=True, gridcolor="rgba(0,0,0,0.06)",
+        tickfont=dict(size=11, color="#64748b"),
+    )
     fig.update_layout(
         template="plotly_white",
-        height=max(240, 46 * len(order) + 90),
-        margin=dict(l=10, r=20, t=44, b=10),
-        title=dict(text="Expected wave timeline — elapsed vs projected", x=0.01,
-                   font=dict(size=14)),
-        legend=dict(orientation="h", y=1.06, x=0, title=""),
-        xaxis=dict(title=""),
-        dragmode=False,
+        height=max(260, 52 * len(order) + 110),
+        margin=dict(l=10, r=120, t=52, b=14),
+        title=dict(text="🕰️  Expected Wave Timeline — elapsed vs projected",
+                   x=0.01, font=dict(size=15, color="#1e293b")),
+        legend=dict(orientation="h", y=1.08, x=0, title="",
+                    font=dict(size=11)),
+        plot_bgcolor="white", paper_bgcolor="rgba(0,0,0,0)",
+        dragmode=False, bargap=0.35,
     )
     return fig
 
