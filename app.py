@@ -36,7 +36,7 @@ st.set_page_config(
     page_title="Quant Trade Levels",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",  # expanded on desktop, collapsed on mobile
 )
 
 # -----------------------------------------------------------------------------
@@ -532,28 +532,6 @@ def pct_from_price(level: float, price: float) -> float:
     return ((level - price) / price) * 100 if price else float("nan")
 
 
-def build_summary_table(plan: dict) -> pd.DataFrame:
-    price = plan["current_price"]
-    rows = [
-        ("Primary Entry (S1)", plan["s1_entry"], "Main accumulation zone (EMA20 / Pivot S1)"),
-        ("Deep Entry (S2)", plan["s2_entry"], "Extended pullback (EMA50 / Pivot S2)"),
-        ("Stop Loss (SL)", plan["stop_loss"], "Invalidation zone — thesis fails below"),
-        ("Take Profit 1 (TP1)", plan["tp1"], f"{plan['rr_tp1']:.1f}x R:R — scale out"),
-        ("Take Profit 2 (TP2)", plan["tp2"], f"{plan['rr_tp2']:.1f}x R:R / Pivot R2 — runner"),
-    ]
-    data = []
-    for label, level, note in rows:
-        data.append(
-            {
-                "Level Type": label,
-                "Target Price ($)": f"{level:,.2f}",
-                "% From Current": f"{pct_from_price(level, price):+.2f}%",
-                "Strategic Notes": note,
-            }
-        )
-    return pd.DataFrame(data)
-
-
 def build_chart(df: pd.DataFrame, plan: dict, ticker: str) -> go.Figure:
     """3-row subplot: price+levels, RSI, MACD."""
     fig = make_subplots(
@@ -624,13 +602,9 @@ def build_chart(df: pd.DataFrame, plan: dict, ticker: str) -> go.Figure:
                 name=f"{label} ({level:,.2f})",
                 line=dict(color=color, width=1.6, dash="dash"),
                 hoverinfo="name",
+                showlegend=False,  # levels are labelled in the cards below
             ),
             row=1, col=1,
-        )
-        fig.add_annotation(
-            x=x1, y=level, text=f"{label}: {level:,.2f}",
-            showarrow=False, xanchor="left", yanchor="middle",
-            font=dict(color=color, size=10), xshift=6, row=1, col=1,
         )
 
     # --- Row 2: RSI -----------------------------------------------------------
@@ -673,14 +647,20 @@ def build_chart(df: pd.DataFrame, plan: dict, ticker: str) -> go.Figure:
 
     fig.update_layout(
         template="plotly_dark",
-        height=820,
-        margin=dict(l=40, r=90, t=40, b=30),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        height=760,
+        margin=dict(l=8, r=12, t=64, b=24),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+            font=dict(size=9), bgcolor="rgba(0,0,0,0)",
+        ),
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        title=dict(text=f"{ticker} — Daily", x=0.01, font=dict(size=16)),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        dragmode=False,
     )
     fig.update_xaxes(rangeslider_visible=False)
+    fig.update_yaxes(automargin=True)
     return fig
 
 
@@ -825,27 +805,92 @@ def render_sidebar() -> dict:
 # -----------------------------------------------------------------------------
 # Main render
 # -----------------------------------------------------------------------------
+def inject_css() -> None:
+    """Global styling for a clean, mobile-first look."""
+    st.markdown(
+        """
+        <style>
+        .block-container {padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1180px;}
+        /* Hide Streamlit chrome for a cleaner app feel */
+        #MainMenu, footer, [data-testid="stDeployButton"], .stDeployButton {visibility: hidden;}
+        /* Header card */
+        .qtl-head {display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between;
+            gap:12px; padding:16px 18px; border-radius:16px;
+            background:linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.015));
+            border:1px solid rgba(255,255,255,0.09);}
+        .qtl-head .nm {font-size:1.05rem; font-weight:600; color:#c9cdd2; margin-bottom:2px;}
+        .qtl-head .px {font-size:1.9rem; font-weight:800; line-height:1.1;}
+        .qtl-head .chg {font-size:1rem; font-weight:600; margin-left:6px;}
+        .qtl-badge {padding:7px 16px; border-radius:24px; font-weight:800; font-size:0.9rem;
+            letter-spacing:0.6px; white-space:nowrap;}
+        /* Metric grid — wraps on mobile automatically */
+        .qtl-grid {display:grid; grid-template-columns:repeat(auto-fit, minmax(148px, 1fr));
+            gap:10px; margin:14px 0 4px;}
+        .qtl-card {padding:13px 15px; border-radius:14px;
+            background:linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.012));
+            border:1px solid rgba(255,255,255,0.08); border-left:4px solid var(--ac,#888);}
+        .qtl-card .lbl {font-size:0.7rem; text-transform:uppercase; letter-spacing:0.7px;
+            color:#9aa0a6; margin-bottom:5px; font-weight:600;}
+        .qtl-card .val {font-size:1.32rem; font-weight:800; line-height:1.05;}
+        .qtl-card .sub {font-size:0.8rem; color:#aab0b7; margin-top:3px;}
+        /* Summary rows */
+        .qtl-srow {display:flex; align-items:center; justify-content:space-between; gap:10px;
+            padding:11px 14px; border-radius:12px; margin-bottom:9px;
+            border:1px solid rgba(255,255,255,0.08); border-left:4px solid var(--ac,#888);
+            background:rgba(255,255,255,0.02);}
+        .qtl-srow .lt {font-weight:700; font-size:0.95rem;}
+        .qtl-srow .nt {font-size:0.76rem; color:#9aa0a6; margin-top:2px;}
+        .qtl-srow .rt {text-align:right; white-space:nowrap;}
+        .qtl-srow .pv {font-weight:800; font-size:1.05rem;}
+        .qtl-srow .pc {font-size:0.78rem; color:#aab0b7;}
+        @media (max-width: 640px) {
+            .block-container {padding-left:0.7rem; padding-right:0.7rem;}
+            .qtl-head .px {font-size:1.55rem;}
+            .qtl-card .val {font-size:1.18rem;}
+            .qtl-grid {gap:8px;}
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _fmt(v: float) -> str:
+    return f"{v:,.2f}"
+
+
 def render_header(name: str, ticker: str, plan: dict) -> None:
     change = plan["daily_change"]
     change_pct = plan["daily_change_pct"]
     arrow = "▲" if change >= 0 else "▼"
-    change_color = "#00C853" if change >= 0 else "#D50000"
+    change_color = "#00E676" if change >= 0 else "#FF5252"
 
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        st.markdown(f"## {name} ({ticker})")
-        st.markdown(
-            f"<div style='font-size:1.6rem;font-weight:700;'>"
-            f"${plan['current_price']:,.2f} "
-            f"<span style='color:{change_color};font-size:1.1rem;'>"
-            f"{arrow} {change:+,.2f} ({change_pct:+.2f}%)</span></div>",
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown("<div style='text-align:right;padding-top:18px;'>", unsafe_allow_html=True)
-        st.markdown("**Market Bias**", unsafe_allow_html=True)
-        st.markdown(bias_badge(plan["bias"]), unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+    palette = {
+        "Bullish": ("#00E676", "rgba(0,200,83,0.16)"),
+        "Bearish": ("#FF5252", "rgba(213,0,0,0.16)"),
+        "Neutral": ("#FFB300", "rgba(255,179,0,0.16)"),
+    }
+    fg, bg = palette.get(plan["bias"], ("#9E9E9E", "rgba(158,158,158,0.16)"))
+
+    st.markdown(
+        f"""
+        <div class="qtl-head">
+          <div>
+            <div class="nm">{name} · {ticker}</div>
+            <div class="px">{_fmt(plan['current_price'])}
+              <span class="chg" style="color:{change_color};">
+                {arrow} {change:+,.2f} ({change_pct:+.2f}%)</span>
+            </div>
+          </div>
+          <div style="text-align:right;">
+            <div class="nm" style="margin-bottom:6px;">Market Bias</div>
+            <span class="qtl-badge" style="color:{fg}; background:{bg};
+              border:1px solid {fg};">{plan['bias'].upper()}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if plan["overbought"]:
         st.warning(
@@ -856,42 +901,61 @@ def render_header(name: str, ticker: str, plan: dict) -> None:
 
 def render_metrics(plan: dict) -> None:
     price = plan["current_price"]
-    m = st.columns(6)
 
-    m[0].metric(
-        "Primary Entry (S1)", f"${plan['s1_entry']:,.2f}",
-        f"{pct_from_price(plan['s1_entry'], price):+.2f}%",
-        delta_color="off",
-    )
-    m[1].metric(
-        "Deep Entry (S2)", f"${plan['s2_entry']:,.2f}",
-        f"{pct_from_price(plan['s2_entry'], price):+.2f}%",
-        delta_color="off",
-    )
-    m[2].metric(
-        "Stop Loss (SL)", f"${plan['stop_loss']:,.2f}",
-        f"{pct_from_price(plan['stop_loss'], price):+.2f}%",
-        delta_color="off",
-    )
-    m[3].metric(
-        "Take Profit 1", f"${plan['tp1']:,.2f}",
-        f"{pct_from_price(plan['tp1'], price):+.2f}%",
-        delta_color="off",
-    )
-    m[4].metric(
-        "Take Profit 2", f"${plan['tp2']:,.2f}",
-        f"{pct_from_price(plan['tp2'], price):+.2f}%",
-        delta_color="off",
-    )
-    m[5].metric(
-        "R:R (TP1 / TP2)",
-        f"{plan['rr_tp1']:.1f} / {plan['rr_tp2']:.1f}",
-        f"ATR {plan['atr']:.2f}",
-        delta_color="off",
-    )
+    cards = [
+        ("Primary Entry (S1)", _fmt(plan["s1_entry"]),
+         f"{pct_from_price(plan['s1_entry'], price):+.2f}% from price", COLOR_S1),
+        ("Deep Entry (S2)", _fmt(plan["s2_entry"]),
+         f"{pct_from_price(plan['s2_entry'], price):+.2f}% from price", COLOR_S2),
+        ("Stop Loss (SL)", _fmt(plan["stop_loss"]),
+         f"{pct_from_price(plan['stop_loss'], price):+.2f}% from price", COLOR_SL),
+        ("Take Profit 1", _fmt(plan["tp1"]),
+         f"{pct_from_price(plan['tp1'], price):+.2f}% from price", COLOR_TP1),
+        ("Take Profit 2", _fmt(plan["tp2"]),
+         f"{pct_from_price(plan['tp2'], price):+.2f}% from price", COLOR_TP2),
+        ("Risk / Reward", f"{plan['rr_tp1']:.1f} / {plan['rr_tp2']:.1f}",
+         f"ATR {plan['atr']:.2f}", "#7E57C2"),
+    ]
+    html = ['<div class="qtl-grid">']
+    for lbl, val, sub, color in cards:
+        html.append(
+            f'<div class="qtl-card" style="--ac:{color};">'
+            f'<div class="lbl">{lbl}</div>'
+            f'<div class="val">{val}</div>'
+            f'<div class="sub">{sub}</div></div>'
+        )
+    html.append("</div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+def render_summary_cards(plan: dict) -> None:
+    price = plan["current_price"]
+    rows = [
+        ("Primary Entry (S1)", plan["s1_entry"],
+         "Main accumulation zone (EMA20 / Pivot S1)", COLOR_S1),
+        ("Deep Entry (S2)", plan["s2_entry"],
+         "Extended pullback (EMA50 / Pivot S2)", COLOR_S2),
+        ("Stop Loss (SL)", plan["stop_loss"],
+         "Invalidation — thesis fails below", COLOR_SL),
+        ("Take Profit 1 (TP1)", plan["tp1"],
+         f"{plan['rr_tp1']:.1f}x R:R — scale out", COLOR_TP1),
+        ("Take Profit 2 (TP2)", plan["tp2"],
+         f"{plan['rr_tp2']:.1f}x R:R / Pivot R2 — runner", COLOR_TP2),
+    ]
+    html = []
+    for label, level, note, color in rows:
+        pct = pct_from_price(level, price)
+        html.append(
+            f'<div class="qtl-srow" style="--ac:{color};">'
+            f'<div><div class="lt">{label}</div><div class="nt">{note}</div></div>'
+            f'<div class="rt"><div class="pv">{_fmt(level)}</div>'
+            f'<div class="pc">{pct:+.2f}%</div></div></div>'
+        )
+    st.markdown("".join(html), unsafe_allow_html=True)
 
 
 def main() -> None:
+    inject_css()
     st.title("📈 Quant Trade Levels")
     st.caption(
         "Daily-timeframe technical level engine — EMA trend bias, RSI/MACD "
@@ -991,11 +1055,14 @@ def main() -> None:
     render_metrics(plan)
     st.markdown("---")
 
-    st.plotly_chart(build_chart(df, plan, display_symbol), use_container_width=True)
+    st.plotly_chart(
+        build_chart(df, plan, display_symbol),
+        use_container_width=True,
+        config={"displayModeBar": False, "scrollZoom": False, "responsive": True},
+    )
 
     st.markdown("### 🎯 Trade Execution Summary")
-    summary = build_summary_table(plan)
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+    render_summary_cards(plan)
 
     with st.expander("🔍 Indicator Snapshot & Pivot Points"):
         piv = plan["pivots"]
