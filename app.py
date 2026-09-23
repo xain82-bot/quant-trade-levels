@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import base64 as _b64
 import datetime as _dt
+import hashlib as _hashlib
 import json as _json
 from urllib.request import Request, urlopen
 
@@ -369,6 +371,217 @@ def load_psx_stock(symbol: str, period: str = "1y") -> pd.DataFrame:
             f"No data available for '{symbol}' from Yahoo (.KA) or the PSX "
             f"Data Portal. It may be newly listed, suspended, or delisted. ({e})"
         )
+
+
+# -----------------------------------------------------------------------------
+# AI chart-image analysis (Anthropic Claude vision)
+# -----------------------------------------------------------------------------
+AI_MODELS = {
+    "Claude Opus 5 (best reasoning)": "claude-opus-5",
+    "Claude Sonnet 5 (faster / cheaper)": "claude-sonnet-5",
+}
+
+_ANALYSIS_SCHEMA_HINT = """
+Return ONLY a single valid JSON object (no markdown, no code fences, no prose
+outside the JSON) with EXACTLY this shape:
+
+{
+  "instrument_guess": "string - ticker/name if visible, else 'Unknown'",
+  "timeframe_guess": "string - e.g. '1H', 'Daily', 'Weekly', else 'Unknown'",
+  "descriptive": {
+    "trend": "string - concise trend description",
+    "bias": "Bullish | Bearish | Neutral",
+    "summary": "2-4 sentence professional read of the price action & structure",
+    "supports": [{"level": "price or zone as string", "rationale": "why"}],
+    "resistances": [{"level": "price or zone as string", "rationale": "why"}],
+    "stop_losses": [{"level": "price as string", "rationale": "why here"}],
+    "observations": ["short actionable bullet", "..."]
+  },
+  "position_sizing": {
+    "suggested_entry": "price as string",
+    "stop": "price as string",
+    "targets": ["price as string", "..."],
+    "entry_num": 0.0,
+    "stop_num": 0.0,
+    "target_nums": [0.0],
+    "risk_reward": "e.g. '1 : 2.4'",
+    "bias_alignment": "how the setup aligns with the overall bias",
+    "notes": "position-sizing rationale in 1-2 sentences"
+  },
+  "elliott": {
+    "degree": "wave degree label, e.g. 'Intermediate'",
+    "narrative": "holistic textbook wave-count read of what has occurred",
+    "current_waves": [{"label": "1/2/3/4/5 or A/B/C", "description": "what & where"}],
+    "next_waves": [{"label": "string", "description": "what is expected next"}],
+    "rules_check": [
+      {"rule": "Wave 2 never retraces >100% of Wave 1", "status": "Pass | Fail | N/A", "detail": "how it holds"},
+      {"rule": "Wave 3 is never the shortest impulse wave", "status": "Pass | Fail | N/A", "detail": "..."},
+      {"rule": "Wave 4 never enters Wave 1 price territory", "status": "Pass | Fail | N/A", "detail": "..."}
+    ],
+    "invalidation": "price level/condition that invalidates this count",
+    "targets": "projected target zone(s) with Fibonacci reasoning",
+    "wave_points": [{"label": "0/1/2/3/4/5 or A/B/C", "x": 0.0, "y": 0.0}],
+    "projected_points": [{"label": "string", "x": 0.0, "y": 0.0}]
+  }
+}
+
+For wave_points and projected_points: x is normalized time from 0.0 (left/oldest
+edge of the chart) to 1.0 (right/newest edge); y is the price at that pivot read
+from the chart's axis (use real price numbers when the axis is legible, otherwise
+a consistent relative scale). wave_points trace the count that has ALREADY formed
+(left to right); projected_points continue the dotted expected path into the
+future (x should exceed the last wave_points x, up to ~1.3).
+"""
+
+_ANALYSIS_SYSTEM = (
+    "You are an elite technical analyst and a strict, textbook-compliant Elliott "
+    "Wave theorist. You read an attached price chart of any instrument and any "
+    "timeframe and produce a rigorous, professional analysis. You NEVER violate "
+    "the three inviolable Elliott Wave rules: (1) Wave 2 cannot retrace more than "
+    "100% of Wave 1; (2) Wave 3 is never the shortest of waves 1, 3 and 5; "
+    "(3) Wave 4 cannot overlap the price territory of Wave 1 (except in "
+    "diagonals). If the visible structure would violate a rule, you relabel the "
+    "count so it complies and state that explicitly. You also respect guidelines "
+    "(alternation, channelling, Fibonacci relationships) and note the wave degree. "
+    "Prices you cannot read precisely are given as approximate zones. You output "
+    "strictly the requested JSON and nothing else."
+)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def analyze_chart_image(
+    image_bytes: bytes, media_type: str, model: str, api_key: str
+) -> dict:
+    """Send the chart image to Claude and return the parsed analysis dict.
+    Cached on the (image, media_type, model) so identical requests don't re-bill;
+    the api_key participates in the cache key but is not otherwise logged."""
+    try:
+        import anthropic
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError(
+            "The 'anthropic' package is not installed. Run "
+            "`pip install anthropic` (it is in requirements.txt)."
+        ) from e
+
+    if not api_key:
+        raise RuntimeError("No Anthropic API key provided.")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    b64 = _b64.standard_b64encode(image_bytes).decode("utf-8")
+
+    user_text = (
+        "Analyze the attached trading chart. Identify structure, then produce: "
+        "(1) descriptive technical analysis with support, resistance and stop-loss "
+        "levels; (2) risk-managed position-sizing inputs (entry, stop, targets, "
+        "R:R) consistent with the overall bias and those levels; (3) a rigorous "
+        "Elliott Wave breakdown of the completed count and the expected next "
+        "waves, strictly obeying all core Elliott Wave rules.\n\n"
+        + _ANALYSIS_SCHEMA_HINT
+    )
+
+    try:
+        resp = client.messages.create(
+            model=model,
+            max_tokens=8000,
+            system=_ANALYSIS_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64,
+                            },
+                        },
+                        {"type": "text", "text": user_text},
+                    ],
+                }
+            ],
+        )
+    except anthropic.AuthenticationError as e:
+        raise RuntimeError("Anthropic rejected the API key (authentication error).") from e
+    except anthropic.RateLimitError as e:
+        raise RuntimeError("Anthropic rate limit hit — wait a moment and retry.") from e
+    except anthropic.APIStatusError as e:
+        raise RuntimeError(f"Anthropic API error ({e.status_code}): {e.message}") from e
+    except anthropic.APIConnectionError as e:
+        raise RuntimeError("Could not reach Anthropic — check your connection.") from e
+
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    return _parse_analysis_json(text)
+
+
+def _parse_analysis_json(text: str) -> dict:
+    """Robustly extract the JSON object from the model's reply."""
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.split("```", 2)[1] if "```" in s[3:] else s
+        s = s.lstrip("json").lstrip("JSON").strip()
+    start, end = s.find("{"), s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("The model did not return JSON. Raw reply:\n" + text[:500])
+    try:
+        return _json.loads(s[start : end + 1])
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"Could not parse the model's JSON ({e}).") from e
+
+
+def build_wave_projection_chart(elliott: dict) -> "go.Figure | None":
+    """Schematic solid (completed) + dotted (projected) Elliott Wave path."""
+    pts = [p for p in (elliott.get("wave_points") or []) if _has_xy(p)]
+    proj = [p for p in (elliott.get("projected_points") or []) if _has_xy(p)]
+    if len(pts) < 2:
+        return None
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=[p["x"] for p in pts], y=[p["y"] for p in pts],
+            mode="lines+markers+text",
+            text=[str(p.get("label", "")) for p in pts],
+            textposition="top center",
+            line=dict(color="#26A69A", width=2.4),
+            marker=dict(size=8, color="#26A69A"),
+            name="Completed waves",
+        )
+    )
+    if proj:
+        bridge_x = [pts[-1]["x"]] + [p["x"] for p in proj]
+        bridge_y = [pts[-1]["y"]] + [p["y"] for p in proj]
+        labels = [""] + [str(p.get("label", "")) for p in proj]
+        fig.add_trace(
+            go.Scatter(
+                x=bridge_x, y=bridge_y,
+                mode="lines+markers+text",
+                text=labels, textposition="bottom center",
+                line=dict(color="#AA00FF", width=2.4, dash="dot"),
+                marker=dict(size=8, color="#AA00FF"),
+                name="Projected path (expected)",
+            )
+        )
+    fig.update_layout(
+        template="plotly_dark", height=420,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title=dict(text="Elliott Wave — completed (solid) vs projected (dotted)",
+                   x=0.01, font=dict(size=14)),
+        legend=dict(orientation="h", y=1.04, x=0, font=dict(size=10)),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(title="time →", showticklabels=False),
+        yaxis=dict(title="price"),
+        dragmode=False,
+    )
+    return fig
+
+
+def _has_xy(p: dict) -> bool:
+    try:
+        float(p.get("x")); float(p.get("y"))
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 # -----------------------------------------------------------------------------
@@ -780,6 +993,45 @@ def render_sidebar() -> dict:
     )
 
     st.sidebar.markdown("---")
+    st.sidebar.subheader("🖼️ AI Chart Image Analysis")
+    chart_image = st.sidebar.file_uploader(
+        "Upload a chart image (any timeframe)",
+        type=["png", "jpg", "jpeg", "webp"],
+        help="Screenshot from any platform. Analyzed by Claude vision into the "
+             "three tabs shown in the main panel.",
+    )
+    ai_model_label = st.sidebar.selectbox(
+        "Analysis model", options=list(AI_MODELS.keys()), index=0,
+    )
+    ai_model = AI_MODELS[ai_model_label]
+
+    # API key — Streamlit secrets if present, else a password field ("Both").
+    api_key = ""
+    try:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        api_key = ""
+    key_from_secrets = bool(api_key)
+    if key_from_secrets:
+        st.sidebar.caption("🔑 Using API key from Streamlit secrets.")
+    else:
+        api_key = st.sidebar.text_input(
+            "Anthropic API Key", type="password",
+            help="Get one at console.anthropic.com. Kept in this session only; "
+                 "never committed. Or set ANTHROPIC_API_KEY in Streamlit secrets.",
+        ).strip()
+
+    with st.sidebar.expander("💰 Position-sizing inputs"):
+        account_size = st.number_input(
+            "Account size", min_value=0.0, value=10000.0, step=500.0,
+            help="Total trading capital (used in the Position Sizing tab).",
+        )
+        risk_pct = st.slider(
+            "Risk per trade (%)", 0.1, 5.0, 1.0, 0.1,
+            help="Percent of account risked if the stop is hit.",
+        )
+
+    st.sidebar.markdown("---")
     st.sidebar.caption(
         "⚠️ Educational tool only. Not financial advice. "
         "Levels are algorithmic estimates from historical data."
@@ -799,6 +1051,11 @@ def render_sidebar() -> dict:
         "atr_mult": atr_mult,
         "rr_tp1": rr_tp1,
         "rr_tp2": rr_tp2,
+        "chart_image": chart_image,
+        "ai_model": ai_model,
+        "api_key": api_key,
+        "account_size": account_size,
+        "risk_pct": risk_pct,
     }
 
 
@@ -954,6 +1211,208 @@ def render_summary_cards(plan: dict) -> None:
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
+# -----------------------------------------------------------------------------
+# AI chart-image analysis — three-tab renderer
+# -----------------------------------------------------------------------------
+def _levels_table(items: list, cols=("Level", "Rationale")) -> None:
+    rows = []
+    for it in items or []:
+        rows.append({cols[0]: str(it.get("level", "")), cols[1]: str(it.get("rationale", ""))})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("None identified.")
+
+
+def _as_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def render_image_analysis(params: dict) -> None:
+    """Render the 3-tab AI analysis of an uploaded chart image. Renders nothing
+    unless an image is uploaded, so the existing dashboard is untouched otherwise."""
+    image_file = params.get("chart_image")
+    if image_file is None:
+        return
+
+    st.markdown("## 🖼️ AI Chart Image Analysis")
+    img_bytes = image_file.getvalue()
+    media_type = image_file.type or "image/png"
+    img_key = _hashlib.sha1(img_bytes).hexdigest()[:16] + "|" + params["ai_model"]
+
+    top = st.columns([1, 2])
+    with top[0]:
+        st.image(img_bytes, caption="Uploaded chart", use_container_width=True)
+    with top[1]:
+        st.caption(
+            "Claude vision reads this chart and fills the three tabs below: "
+            "descriptive levels, position sizing, and a rules-checked Elliott "
+            "Wave count. Analysis is cached, so it only bills once per image/model."
+        )
+        run = st.button("🔍 Analyze / re-analyze chart", type="primary")
+
+    if not params.get("api_key"):
+        st.info(
+            "Add your Anthropic API key in the sidebar (or Streamlit secrets) to "
+            "run the analysis. Get one at console.anthropic.com."
+        )
+        return
+
+    # Cache the result in session_state so tab switches / slider changes don't re-bill.
+    cache = st.session_state.setdefault("_img_analysis", {})
+    if run or img_key in cache:
+        if run and img_key not in cache:
+            try:
+                with st.spinner("Analyzing chart with Claude…"):
+                    cache[img_key] = analyze_chart_image(
+                        img_bytes, media_type, params["ai_model"], params["api_key"]
+                    )
+            except (RuntimeError, ValueError) as e:
+                st.error(f"❌ {e}")
+                return
+            except Exception as e:  # pragma: no cover
+                st.error(f"❌ Unexpected analysis error: {e}")
+                return
+        data = cache.get(img_key)
+        if data:
+            _render_analysis_tabs(data, params)
+    else:
+        st.caption("Click **Analyze** to run the vision analysis on this image.")
+
+
+def _render_analysis_tabs(data: dict, params: dict) -> None:
+    meta = (
+        f"Instrument: **{data.get('instrument_guess', 'Unknown')}** · "
+        f"Timeframe: **{data.get('timeframe_guess', 'Unknown')}**"
+    )
+    st.caption(meta)
+
+    t1, t2, t3 = st.tabs(
+        ["📝 Descriptive TA", "💰 Position Sizing", "🌊 Elliott Wave"]
+    )
+
+    # --- Tab 1: Descriptive technical analysis --------------------------------
+    with t1:
+        d = data.get("descriptive", {}) or {}
+        bias = d.get("bias", "Neutral")
+        st.markdown(f"**Trend:** {d.get('trend', '—')}  ")
+        st.markdown(bias_badge(bias), unsafe_allow_html=True)
+        st.write(d.get("summary", ""))
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**🟢 Support levels**")
+            _levels_table(d.get("supports"))
+        with c2:
+            st.markdown("**🔴 Resistance levels**")
+            _levels_table(d.get("resistances"))
+        with c3:
+            st.markdown("**🛑 Stop-loss markers**")
+            _levels_table(d.get("stop_losses"))
+        obs = d.get("observations") or []
+        if obs:
+            st.markdown("**Key observations**")
+            for o in obs:
+                st.markdown(f"- {o}")
+
+    # --- Tab 2: Automated position sizing -------------------------------------
+    with t2:
+        ps = data.get("position_sizing", {}) or {}
+        st.caption(
+            "Adjust the AI's read below if needed; sizing uses your account size "
+            "and risk % from the sidebar."
+        )
+        ai_entry = _as_float(ps.get("entry_num")) or 0.0
+        ai_stop = _as_float(ps.get("stop_num")) or 0.0
+        ai_targets = [x for x in (_as_float(t) for t in ps.get("target_nums") or []) if x]
+
+        c1, c2, c3 = st.columns(3)
+        entry = c1.number_input("Entry", value=float(ai_entry), format="%.4f")
+        stop = c2.number_input("Stop loss", value=float(ai_stop), format="%.4f")
+        first_target = ai_targets[0] if ai_targets else 0.0
+        target = c3.number_input("Primary target", value=float(first_target), format="%.4f")
+
+        account = float(params.get("account_size") or 0.0)
+        risk_pct = float(params.get("risk_pct") or 1.0)
+        per_unit_risk = abs(entry - stop)
+        risk_amount = account * risk_pct / 100.0
+
+        if per_unit_risk > 0 and account > 0:
+            size = risk_amount / per_unit_risk
+            position_value = size * entry
+            reward = abs(target - entry)
+            rr = (reward / per_unit_risk) if per_unit_risk else 0.0
+            m = st.columns(4)
+            m[0].metric("Risk amount", f"{risk_amount:,.2f}", f"{risk_pct:.1f}% of acct")
+            m[1].metric("Position size", f"{size:,.2f} units")
+            m[2].metric("Position value", f"{position_value:,.2f}")
+            m[3].metric("R : R (to target)", f"1 : {rr:.2f}")
+        else:
+            st.warning(
+                "Enter a non-zero account size (sidebar) and distinct Entry/Stop "
+                "to compute position size."
+            )
+
+        st.markdown("**AI sizing read**")
+        st.write(
+            f"- **Suggested entry:** {ps.get('suggested_entry', '—')}\n"
+            f"- **Stop:** {ps.get('stop', '—')}\n"
+            f"- **Targets:** {', '.join(str(x) for x in ps.get('targets', [])) or '—'}\n"
+            f"- **Risk:Reward:** {ps.get('risk_reward', '—')}\n"
+            f"- **Bias alignment:** {ps.get('bias_alignment', '—')}"
+        )
+        if ps.get("notes"):
+            st.info(ps["notes"])
+
+    # --- Tab 3: Elliott Wave --------------------------------------------------
+    with t3:
+        ew = data.get("elliott", {}) or {}
+        st.markdown(f"**Wave degree:** {ew.get('degree', '—')}")
+        st.write(ew.get("narrative", ""))
+
+        fig = build_wave_projection_chart(ew)
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True,
+                            config={"displayModeBar": False})
+        else:
+            st.caption("No numeric wave pivots were returned to plot a path.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Completed waves**")
+            for w in ew.get("current_waves") or []:
+                st.markdown(f"- **{w.get('label', '')}** — {w.get('description', '')}")
+        with c2:
+            st.markdown("**Expected next waves**")
+            for w in ew.get("next_waves") or []:
+                st.markdown(f"- **{w.get('label', '')}** — {w.get('description', '')}")
+
+        rc = ew.get("rules_check") or []
+        if rc:
+            st.markdown("**Elliott Wave rule compliance**")
+            rows = []
+            for r in rc:
+                status = str(r.get("status", ""))
+                icon = {"Pass": "✅", "Fail": "❌", "N/A": "➖"}.get(status, "")
+                rows.append({
+                    "Rule": r.get("rule", ""),
+                    "Status": f"{icon} {status}",
+                    "Detail": r.get("detail", ""),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        cols = st.columns(2)
+        cols[0].markdown(f"**Invalidation:** {ew.get('invalidation', '—')}")
+        cols[1].markdown(f"**Target zone(s):** {ew.get('targets', '—')}")
+
+    st.caption(
+        "AI analysis is probabilistic and for education only — not financial "
+        "advice. Verify levels against your own charting."
+    )
+
+
 def main() -> None:
     inject_css()
     st.title("📈 Quant Trade Levels")
@@ -963,6 +1422,12 @@ def main() -> None:
     )
 
     params = render_sidebar()
+
+    # --- New feature: AI chart-image analysis (shown only when an image is
+    # uploaded; the existing live-data dashboard below is left untouched). -----
+    if params.get("chart_image") is not None:
+        render_image_analysis(params)
+        st.markdown("---")
 
     # --- Data acquisition, branched by source --------------------------------
     if params["is_psx_stock"]:

@@ -12,6 +12,16 @@ index, with EMA trend bias, RSI/MACD momentum filters and classic pivot points.
   `dps.psx.com.pk`.
 - **Upload CSV** — any daily history exported from Investing.com or TradingView.
 
+## AI Chart Image Analysis (optional)
+Upload any chart screenshot (any timeframe) in the sidebar to get three tabs of
+Claude-vision analysis: **Descriptive TA** (support/resistance/stop-loss),
+**Position Sizing** (risk-managed size from your account & risk %), and a
+rules-checked **Elliott Wave** count with a projected-path chart.
+
+Requires an Anthropic API key — enter it in the sidebar, or set
+`ANTHROPIC_API_KEY` in `.streamlit/secrets.toml` (local) or the Streamlit Cloud
+Secrets manager. The key is never committed.
+
 ## Run locally
 ```bash
 pip install -r requirements.txt
