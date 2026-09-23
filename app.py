@@ -1089,7 +1089,7 @@ def build_wave_timeline_chart(data: dict, close: pd.Series) -> "go.Figure | None
     fig.add_vline(x=now, line=dict(color="#94a3b8", width=1.4, dash="dot"))
     fig.add_annotation(x=now, y=1.02, yref="paper", text="now  ▸ future",
                        showarrow=False, xanchor="left",
-                       font=dict(color="#94a3b8", size=11))
+                       font=dict(color="#64748b", size=11))
 
     # Duration (and fib) labels at the end of each bar.
     for _, r in df.iterrows():
@@ -1103,14 +1103,18 @@ def build_wave_timeline_chart(data: dict, close: pd.Series) -> "go.Figure | None
                                       else "#334155")),
         )
 
+    # Right x-padding so the end-of-bar labels sit inside the frame.
+    t0, t1 = df["start"].min(), df["end"].max()
+    span = (t1 - t0) or pd.Timedelta(days=30)
     fig.update_xaxes(
         title="", showgrid=True, gridcolor="rgba(0,0,0,0.06)",
         tickfont=dict(size=11, color="#64748b"),
+        range=[t0 - span * 0.03, t1 + span * 0.42],
     )
     fig.update_layout(
         template="plotly_white",
         height=max(260, 52 * len(order) + 110),
-        margin=dict(l=10, r=120, t=52, b=14),
+        margin=dict(l=10, r=30, t=52, b=14),
         title=dict(text="🕰️  Expected Wave Timeline — elapsed vs projected",
                    x=0.01, font=dict(size=15, color="#1e293b")),
         legend=dict(orientation="h", y=1.08, x=0, title="",
@@ -1280,20 +1284,46 @@ def build_ew_report_chart(wk, data: dict) -> "go.Figure":
                           line=dict(color=color, width=1.4), layer="above")
         fig.add_annotation(x=s + (e - s) / 2, y=yy + 0.006, xref="x", yref="paper",
                            text=f"<b>{b.get('label', '')}</b>", showarrow=False,
-                           font=dict(size=9.5, color=color), yanchor="bottom")
+                           font=dict(size=10, color=color), yanchor="bottom")
+
+    # --- Axis ranges with generous headroom so labels never clip / overlap ----
+    ys = [v for v in close.values if v is not None]
+    ys += [r[1] for r in comp] + [r[1] for r in proj]
+    ys += [y for y in (_num(l.get("price")) for l in levels) if y]
+    if lo:
+        ys.append(lo)
+    if hi:
+        ys.append(hi)
+    ys = [y for y in ys if y is not None and (not log or y > 0)]
+    if ys:
+        ymin, ymax = min(ys), max(ys)
+        if log:
+            import math
+            yr = [math.log10(ymin * 0.80), math.log10(ymax * 1.35)]
+        else:
+            pad = (ymax - ymin) or (ymax * 0.1) or 1.0
+            yr = [ymin - pad * 0.18, ymax + pad * 0.30]  # extra top headroom
+    else:
+        yr = None
+
+    xmin = close.index[0]
+    span = (right - xmin) or (close.index[-1] - close.index[0])
+    xmax = right + span * 0.07  # right padding for projected labels
 
     fig.update_layout(
-        template="plotly_white", height=620,
-        margin=dict(l=12, r=124, t=76, b=18),
-        legend=dict(orientation="h", y=1.10, x=0, font=dict(size=10.5),
+        template="plotly_white", height=760,
+        margin=dict(l=14, r=140, t=92, b=24),
+        legend=dict(orientation="h", y=1.09, x=0, font=dict(size=11),
                     bgcolor="rgba(0,0,0,0)"),
         title=dict(text="Primary degree — where we actually are", x=0.01,
-                   y=0.985, font=dict(size=16, color="#0f172a")),
+                   y=0.985, font=dict(size=17, color="#0f172a")),
         yaxis=dict(type="log" if log else "linear", showgrid=True,
                    gridcolor="rgba(0,0,0,0.06)", tickprefix="$",
-                   tickfont=dict(size=11, color="#475569")),
+                   tickfont=dict(size=11.5, color="#334155"),
+                   range=yr),
         xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)",
-                   tickfont=dict(size=11, color="#475569")),
+                   tickfont=dict(size=11.5, color="#334155"),
+                   range=[xmin, xmax]),
         plot_bgcolor="white", paper_bgcolor="rgba(0,0,0,0)",
         hovermode="x unified", dragmode=False,
     )
