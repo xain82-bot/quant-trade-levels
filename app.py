@@ -386,6 +386,7 @@ Return ONLY a single valid JSON object (no markdown, no code fences, no prose
 outside the JSON) with EXACTLY this shape:
 
 {
+  "reasoning": "REQUIRED. Work the Elliott count out here step by step BEFORE filling the fields below: state the impulse direction, list each pivot with its y, then explicitly verify wave2-vs-start, wave3>wave1, wave4-no-overlap, wave5>wave3, wave3-not-shortest. If any check fails, re-label until it passes. This field is your scratchpad and is not shown to the user.",
   "instrument_guess": "string - ticker/name if visible, else 'Unknown'",
   "timeframe_guess": "string - e.g. '1H', 'Daily', 'Weekly', else 'Unknown'",
   "descriptive": {
@@ -409,6 +410,7 @@ outside the JSON) with EXACTLY this shape:
     "notes": "position-sizing rationale in 1-2 sentences"
   },
   "elliott": {
+    "structure_type": "impulse | corrective | diagonal | unclear",
     "degree": "wave degree label, e.g. 'Intermediate'",
     "narrative": "holistic textbook wave-count read of what has occurred",
     "current_waves": [{"label": "1/2/3/4/5 or A/B/C", "description": "what & where"}],
@@ -432,24 +434,46 @@ FRACTIONS so they can be drawn directly on top of the uploaded image:
     (So a swing HIGH has a SMALL y, a swing LOW has a LARGE y.)
 Place each pivot as accurately as you can on the actual candles/price line in the
 image. wave_points trace the count that has ALREADY formed, left to right, ending
-at the most recent pivot. projected_points continue the EXPECTED future path to
-the right of the last completed pivot (x increasing, up to ~1.0); their y values
-reflect the expected swing highs/lows. Include "price" as the axis price at that
-pivot when the axis is legible.
+at the most recent completed pivot (its x is usually between 0.9 and 1.0).
+
+projected_points are the EXPECTED FUTURE path and are drawn in the empty space to
+the RIGHT of your chart, so give them x values BETWEEN 1.03 AND 1.30 (increasing,
+never inside the image). Their y values use the SAME 0..1 vertical scale as the
+image, so a y of 0.30 lines up horizontally with the price level at 30% down from
+the top. Provide 2-4 projected pivots that obey Elliott expectations for whatever
+comes next (e.g. a corrective A-B-C after a completed impulse, or the next impulse
+leg). Include "price" as the axis price at each pivot when the axis is legible.
 """
 
 _ANALYSIS_SYSTEM = (
     "You are an elite technical analyst and a strict, textbook-compliant Elliott "
     "Wave theorist. You read an attached price chart of any instrument and any "
-    "timeframe and produce a rigorous, professional analysis. You NEVER violate "
-    "the three inviolable Elliott Wave rules: (1) Wave 2 cannot retrace more than "
-    "100% of Wave 1; (2) Wave 3 is never the shortest of waves 1, 3 and 5; "
-    "(3) Wave 4 cannot overlap the price territory of Wave 1 (except in "
-    "diagonals). If the visible structure would violate a rule, you relabel the "
-    "count so it complies and state that explicitly. You also respect guidelines "
-    "(alternation, channelling, Fibonacci relationships) and note the wave degree. "
-    "Prices you cannot read precisely are given as approximate zones. You output "
-    "strictly the requested JSON and nothing else."
+    "timeframe and produce a rigorous, professional analysis.\n\n"
+    "ELLIOTT WAVE METHOD — follow this exact procedure and do NOT shortcut it:\n"
+    "1. Determine the direction of the impulse you are counting FIRST. An impulse "
+    "UP has waves 1,3,5 pointing up and 2,4 pulling back down; an impulse DOWN is "
+    "the mirror. Pick the direction that matches the dominant swing on the chart.\n"
+    "2. Assign pivots so the geometry is internally consistent. For an UP impulse: "
+    "wave 2 low must stay ABOVE the wave 0 start; wave 3 high must EXCEED wave 1 "
+    "high; wave 4 low must stay ABOVE wave 1 high (no overlap); wave 5 high must "
+    "EXCEED wave 3 high (unless it is an explicit truncation, which you must name). "
+    "Mirror all of this for a DOWN impulse. A point labelled '5' that sits below "
+    "the start of an up-impulse (or above the start of a down-impulse) is WRONG — "
+    "that is not an impulse; relabel it as a correction (A-B-C) or a new impulse.\n"
+    "3. Enforce the THREE inviolable rules: (a) Wave 2 never retraces more than "
+    "100% of Wave 1; (b) Wave 3 is never the shortest of 1/3/5; (c) Wave 4 never "
+    "enters Wave 1 price territory (except diagonals).\n"
+    "4. VALIDATE before you output: re-check every rule and every directional "
+    "constraint above against the y-coordinates you assigned. If ANY fails, "
+    "re-derive the count until it passes. Never output a labelled impulse that "
+    "violates a rule.\n"
+    "5. If the visible price action does NOT form a clean, rule-compliant Elliott "
+    "structure, say so honestly: set structure_type to 'unclear' or 'corrective', "
+    "give your best partial read, and do NOT fabricate a 1-2-3-4-5 that breaks the "
+    "rules just to fill the fields.\n\n"
+    "Also respect the guidelines (alternation, channelling, Fibonacci ratios) and "
+    "note the wave degree. Prices you cannot read precisely are approximate zones. "
+    "Output STRICTLY the requested JSON and nothing else."
 )
 
 
@@ -574,9 +598,11 @@ def build_wave_overlay_chart(
     if len(pts) < 2:
         return None
 
+    # Future zone extends the x-axis to the right of the image (x=1) so the
+    # projected path has clear, uncramped space. Image stays pinned to [0, 1].
+    x_right = 1.34
     b64 = _b64.standard_b64encode(image_bytes).decode("utf-8")
     fig = go.Figure()
-    # Uploaded chart as the background; axes span 0..1 with a top-left origin.
     fig.add_layout_image(
         dict(
             source=f"data:{media_type};base64,{b64}",
@@ -584,14 +610,26 @@ def build_wave_overlay_chart(
             xanchor="left", yanchor="top", sizing="stretch", layer="below",
         )
     )
+    # Shade the future zone and mark "now".
+    fig.add_vrect(x0=1.0, x1=x_right, fillcolor="#0E1117", opacity=0.55, line_width=0)
+    fig.add_vline(x=1.0, line=dict(color="#8892a0", width=1, dash="dot"))
+    fig.add_annotation(
+        x=1.0, y=0.02, text="now", showarrow=False, xanchor="left",
+        yanchor="top", font=dict(color="#8892a0", size=11),
+    )
+    fig.add_annotation(
+        x=(1.0 + x_right) / 2, y=0.06, text="◀ projected future ▶", showarrow=False,
+        font=dict(color="#FFD54F", size=11),
+    )
+
     fig.add_trace(
         go.Scatter(
             x=[p["x"] for p in pts], y=[p["y"] for p in pts],
             mode="lines+markers+text",
             text=[str(p.get("label", "")) for p in pts],
             textposition="top center",
-            textfont=dict(color="#00E5FF", size=14),
-            line=dict(color="#00E5FF", width=2.4),
+            textfont=dict(color="#00E5FF", size=15),
+            line=dict(color="#00E5FF", width=2.6),
             marker=dict(size=9, color="#00E5FF"),
             name="Completed waves",
         )
@@ -604,23 +642,23 @@ def build_wave_overlay_chart(
             go.Scatter(
                 x=bridge_x, y=bridge_y,
                 mode="lines+markers+text",
-                text=labels, textposition="bottom center",
-                textfont=dict(color="#FFD54F", size=14),
-                line=dict(color="#FFD54F", width=2.6, dash="dot"),
-                marker=dict(size=9, color="#FFD54F"),
+                text=labels, textposition="middle right",
+                textfont=dict(color="#FFD54F", size=15),
+                line=dict(color="#FFD54F", width=3.0, dash="dot"),
+                marker=dict(size=10, color="#FFD54F"),
                 name="Projected path (expected)",
             )
         )
-    fig.update_xaxes(range=[0, 1], visible=False, fixedrange=True)
+    fig.update_xaxes(range=[-0.02, x_right], visible=False, fixedrange=True)
     fig.update_yaxes(range=[1, 0], visible=False, fixedrange=True)  # top-left origin
     fig.update_layout(
-        height=540, margin=dict(l=6, r=6, t=38, b=6),
+        height=560, margin=dict(l=6, r=6, t=40, b=6),
         title=dict(
-            text="Elliott Wave overlay — completed (cyan) vs projected (dotted amber)",
-            x=0.01, font=dict(size=13),
+            text="Elliott Wave — completed count (cyan) on your chart, expected path (dotted amber) in the future zone",
+            x=0.01, font=dict(size=12.5),
         ),
         legend=dict(orientation="h", y=1.03, x=0, font=dict(size=10)),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#0E1117",
         dragmode=False,
     )
     return fig
@@ -1424,7 +1462,16 @@ def _render_analysis_tabs(
     # --- Tab 3: Elliott Wave --------------------------------------------------
     with t3:
         ew = data.get("elliott", {}) or {}
-        st.markdown(f"**Wave degree:** {ew.get('degree', '—')}")
+        stype = str(ew.get("structure_type", "")).lower()
+        cols = st.columns(2)
+        cols[0].markdown(f"**Structure:** {ew.get('structure_type', '—')}")
+        cols[1].markdown(f"**Wave degree:** {ew.get('degree', '—')}")
+        if stype == "unclear":
+            st.warning(
+                "The model judged the visible structure as not a clean, "
+                "rule-compliant Elliott pattern — treat the count below as a "
+                "tentative read, not a definitive labelling."
+            )
         st.write(ew.get("narrative", ""))
 
         fig = build_wave_overlay_chart(img_bytes, media_type, ew)
