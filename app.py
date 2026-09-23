@@ -1637,6 +1637,7 @@ def render_sidebar() -> dict:
             "PSX Index (KSE indices)",
             "Upload CSV (any instrument)",
             "AI Chart Image Analysis",
+            "Deep Elliott Wave Analysis",
         ],
         index=0,
         help=(
@@ -1646,13 +1647,15 @@ def render_sidebar() -> dict:
             "PSX Index: official KSE indices incl. the All Share aggregate. "
             "Upload CSV: any history exported from Investing.com / TradingView. "
             "AI Chart Image Analysis: upload a chart screenshot for Claude vision "
-            "analysis (Descriptive TA, Position Sizing, Deep Elliott Wave)."
+            "analysis (Descriptive TA, Position Sizing, Deep Elliott Wave). "
+            "Deep Elliott Wave Analysis: just enter a ticker — no image needed."
         ),
     )
     is_psx_stock = source.startswith("PSX Stock")
     is_psx = source.startswith("PSX Index")
     is_csv = source.startswith("Upload")
     is_image = source.startswith("AI Chart Image")
+    is_dew = source.startswith("Deep Elliott")
 
     ticker = "NVDA"
     csv_label = "KSE All Share Index"
@@ -1753,6 +1756,26 @@ def render_sidebar() -> dict:
                 "Risk per trade (%)", 0.1, 5.0, 1.0, 0.1,
                 help="Percent of account risked if the stop is hit.",
             )
+    elif is_dew:
+        st.sidebar.caption("Enter the ticker & timeframe in the main window.")
+        ai_model_label = st.sidebar.selectbox(
+            "Analysis model", options=list(AI_MODELS.keys()), index=1,  # Opus 5
+        )
+        ai_model = AI_MODELS[ai_model_label]
+        try:
+            api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            api_key = ""
+        if api_key and "REPLACE" in api_key:
+            api_key = ""
+        if api_key:
+            st.sidebar.caption("🔑 Using API key from Streamlit secrets.")
+        else:
+            api_key = st.sidebar.text_input(
+                "Anthropic API Key", type="password",
+                help="Get one at console.anthropic.com. Kept in this session "
+                     "only; never committed. Or set ANTHROPIC_API_KEY in secrets.",
+            ).strip()
     else:
         ticker = st.sidebar.text_input(
             "Ticker Symbol", value="NVDA",
@@ -1762,7 +1785,7 @@ def render_sidebar() -> dict:
     # Lookback + risk parameters apply only to the live-data sources.
     period_label = list(PERIOD_OPTIONS.keys())[1]  # default 1 Year
     atr_mult, rr_tp1, rr_tp2 = 1.5, 1.5, 3.0
-    if not is_image:
+    if not is_image and not is_dew:
         period_label = st.sidebar.selectbox(
             "Lookback Period",
             options=list(PERIOD_OPTIONS.keys()),
@@ -1793,6 +1816,7 @@ def render_sidebar() -> dict:
         "is_psx": is_psx,
         "is_csv": is_csv,
         "is_image": is_image,
+        "is_dew": is_dew,
         "ticker": ticker,
         "psx_symbol": psx_symbol,
         "psx_stock_symbol": psx_stock_symbol,
@@ -2136,45 +2160,29 @@ def _render_analysis_tabs(
     )
 
 
-def _render_deep_ew_from_image(data: dict, params: dict) -> None:
-    """Elliott Wave tab: fetch the detected instrument's real history and run the
-    rigorous multi-degree Deep Elliott Wave report on it (graphs, rule tables,
-    Fibonacci targets, projected path)."""
-    guess = str(data.get("instrument_guess", "")).strip()
-    tf_guess = str(data.get("timeframe_guess", "")).strip()
-    st.caption(
-        f"Detected from image → instrument: **{guess or 'Unknown'}**, timeframe: "
-        f"**{tf_guess or 'Unknown'}**. The report below fetches this instrument's "
-        f"real history and runs a multi-degree Elliott Wave analysis on it."
-    )
-
+def _deep_ew_ticker_flow(params: dict, suggested_ticker: str = "",
+                         tf_index: int = 0, kp: str = "dew") -> None:
+    """Shared: ticker + timeframe + sensitivity inputs → fetch → deep EW report.
+    Used by both the image Elliott tab and the standalone Deep EW source."""
     if not params.get("api_key"):
         st.info("Add your Anthropic API key in the sidebar to run the report.")
         return
 
-    # Suggest a symbol only when the guess already looks like a ticker.
-    sym_suggest = guess if (guess and " " not in guess
-                            and guess.lower() != "unknown" and len(guess) <= 12) else ""
-    tf_default = 0 if ("w" in tf_guess.lower() or tf_guess == "") else 1
-
     c = st.columns([1.2, 1, 1])
     ticker = c[0].text_input(
-        "Fetch ticker / symbol", value=sym_suggest, key="img_ew_ticker",
+        "Fetch ticker / symbol", value=suggested_ticker, key=f"{kp}_ticker",
         help="Yahoo ticker (AUTL, AAPL), PSX symbol (SNGP.KA) or PSX index "
-             "(ALLSHR). Edit if the auto-detected name isn't a valid symbol.",
+             "(ALLSHR, KSE100).",
     ).strip().upper()
-    timeframe = c[1].selectbox("Timeframe", ["Weekly", "Daily"], index=tf_default,
-                               key="img_ew_tf")
-    sens = c[2].slider("Swing sensitivity (%)", 3, 15, 8, key="img_ew_sens") / 100.0
+    timeframe = c[1].selectbox("Timeframe", ["Weekly", "Daily"], index=tf_index,
+                               key=f"{kp}_tf")
+    sens = c[2].slider("Swing sensitivity (%)", 3, 15, 8, key=f"{kp}_sens") / 100.0
 
     if not ticker:
-        st.info(
-            "Enter the instrument's ticker/symbol above and click Run. (The name "
-            "read from the image may not be a valid data symbol.)"
-        )
+        st.info("Enter a ticker/symbol above, then click Run Deep Elliott Wave.")
         return
 
-    run = st.button("🌊 Run Deep Elliott Wave", type="primary", key="img_ew_run")
+    run = st.button("🌊 Run Deep Elliott Wave", type="primary", key=f"{kp}_run")
     ckey = f"{ticker}|{timeframe}|{sens}|{params['ai_model']}"
     store = st.session_state.setdefault("_ew_report", {})
 
@@ -2211,6 +2219,34 @@ def _render_deep_ew_from_image(data: dict, params: dict) -> None:
         _render_ew_report(bundle)
     elif not run:
         st.caption("Confirm the ticker and click **Run Deep Elliott Wave**.")
+
+
+def _render_deep_ew_from_image(data: dict, params: dict) -> None:
+    """Elliott Wave tab of the image source: pre-fill the ticker from what Claude
+    detected in the image, then run the same deep report."""
+    guess = str(data.get("instrument_guess", "")).strip()
+    tf_guess = str(data.get("timeframe_guess", "")).strip()
+    st.caption(
+        f"Detected from image → instrument: **{guess or 'Unknown'}**, timeframe: "
+        f"**{tf_guess or 'Unknown'}**. The report below fetches this instrument's "
+        f"real history and runs a multi-degree Elliott Wave analysis on it."
+    )
+    sym_suggest = guess if (guess and " " not in guess
+                            and guess.lower() != "unknown" and len(guess) <= 12) else ""
+    tf_index = 0 if ("w" in tf_guess.lower() or tf_guess == "") else 1
+    _deep_ew_ticker_flow(params, sym_suggest, tf_index, kp="img_ew")
+
+
+def render_deep_ew_page(params: dict) -> None:
+    """Standalone Deep Elliott Wave source: no image — enter a ticker & timeframe."""
+    st.markdown("## 🌊 Deep Elliott Wave Analysis")
+    st.caption(
+        "Enter a ticker/symbol and timeframe — the app fetches its full history "
+        "from a live source and produces a rigorous, master-practitioner "
+        "multi-degree Elliott Wave analysis with the wave-map chart, timeline, "
+        "rule verification, and Fibonacci price/time targets. No chart image needed."
+    )
+    _deep_ew_ticker_flow(params, "", 0, kp="dew_page")
 
 
 def render_deep_ew(params: dict) -> None:
@@ -2465,6 +2501,11 @@ def main() -> None:
     # not rendered at all. ------------------------------------------------------
     if params["is_image"]:
         render_image_analysis(params)
+        return
+
+    # --- Standalone Deep Elliott Wave Analysis (ticker only, no image) --------
+    if params.get("is_dew"):
+        render_deep_ew_page(params)
         return
 
     # --- Data acquisition, branched by source --------------------------------
