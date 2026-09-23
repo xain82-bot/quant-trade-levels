@@ -1201,7 +1201,7 @@ def build_ew_report_chart(wk, data: dict, window_start=None,
             texts.append(f"<b>{lab}</b><br>${y:,.3f}")
         fig.add_trace(go.Scatter(
             x=cx, y=cy, mode="markers+text", text=texts, textposition=positions,
-            textfont=dict(size=9, color="#0f172a"),
+            textfont=dict(size=10, color="#0f172a"),
             marker=dict(size=6, color=C_LINE, line=dict(width=1.2, color="#fff")),
             name="Wave pivots", showlegend=False, cliponaxis=False))
 
@@ -1227,7 +1227,7 @@ def build_ew_report_chart(wk, data: dict, window_start=None,
                                    for i in range(len(proj))]
         fig.add_trace(go.Scatter(
             x=px_, y=py_, mode="lines+markers+text", text=pt_,
-            textposition=pos, textfont=dict(size=9, color="#b45309"),
+            textposition=pos, textfont=dict(size=10, color="#b45309"),
             line=dict(color=C_PROJ, width=2, dash="dash"),
             marker=dict(size=6, color="#fff", line=dict(width=1.6, color=C_PROJ),
                         symbol="circle"),
@@ -1248,26 +1248,30 @@ def build_ew_report_chart(wk, data: dict, window_start=None,
                       opacity=0.06, line_width=0, layer="below")
     fig.add_vline(x=last_date, line=dict(color="#94a3b8", width=1.2, dash="dot"))
 
-    # --- Horizontal reference levels.
+    # --- Horizontal reference levels (labels alternate L/R by price so the
+    # many close-together levels don't stack on one side).
     style_map = {
-        "invalidation": ("#C1121F", "dash"), "floor": ("#64748b", "dash"),
-        "support": ("#64748b", "dash"), "terminal": ("#DB2777", "dot"),
+        "invalidation": ("#C1121F", "dash"), "floor": ("#475569", "dash"),
+        "support": ("#475569", "dash"), "terminal": ("#DB2777", "dot"),
     }
     levels = list(data.get("horizontal_levels") or [])
     inv = _num(data.get("invalidation_price"))
     if inv and not any(_num(l.get("price")) == inv for l in levels):
         levels.append({"price": inv, "label": data.get("invalidation_label",
                        f"INVALID ${inv}"), "style": "invalidation"})
-    for lv in levels:
+    levels = [lv for lv in levels
+              if _num(lv.get("price")) is not None
+              and not (log and _num(lv.get("price")) <= 0)]
+    levels.sort(key=lambda lv: _num(lv.get("price")))
+    for i, lv in enumerate(levels):
         y = _num(lv.get("price"))
-        if y is None or (log and y <= 0):
-            continue
         col, dash = style_map.get(str(lv.get("style", "")).lower(),
-                                  ("#64748b", "dash"))
+                                  ("#475569", "dash"))
+        pos = "right" if i % 2 == 0 else "left"
         fig.add_hline(y=y, line=dict(color=col, width=1.3, dash=dash),
                       annotation_text=lv.get("label", ""),
-                      annotation_position="right",
-                      annotation_font=dict(size=10, color=col))
+                      annotation_position=pos,
+                      annotation_font=dict(size=10.5, color=col))
 
     # --- Retracement grid (green box + boundary labels).
     rz = data.get("retracement_zone") or {}
@@ -1304,24 +1308,26 @@ def build_ew_report_chart(wk, data: dict, window_start=None,
         col = "#EA7317" if str(b.get("color", "")).lower().startswith("or") else "#2B6CB0"
         brs.append((s, e, str(b.get("label", "")), col))
     brs.sort(key=lambda r: r[0])
-    # One bracket per row → labels can never collide horizontally.
+    # One bracket per row → labels can never collide horizontally. Compact rows
+    # tucked at the very top so the price fills most of the chart.
     placed = [(s, e, lab, col, i) for i, (s, e, lab, col) in enumerate(brs)]
     n_rows = max(len(brs), 1)
-    top_y, dz = 0.985, 0.052
+    top_y, dz = 0.992, 0.040
     for s, e, lab, col, ri in placed:
         yy = top_y - ri * dz
         fig.add_shape(type="line", x0=s, x1=e, xref="x", y0=yy, y1=yy, yref="paper",
                       line=dict(color=col, width=1.6), layer="above")
         for xx in (s, e):
             fig.add_shape(type="line", x0=xx, x1=xx, xref="x",
-                          y0=yy, y1=yy - 0.014, yref="paper",
+                          y0=yy, y1=yy - 0.012, yref="paper",
                           line=dict(color=col, width=1.6), layer="above")
-        fig.add_annotation(x=s, y=yy + 0.004, xref="x", yref="paper",
+        fig.add_annotation(x=s, y=yy + 0.003, xref="x", yref="paper",
                            text=f"<b>{lab}</b>", showarrow=False,
                            xanchor="left", yanchor="bottom",
-                           font=dict(size=9, color=col))
+                           font=dict(size=9.5, color=col))
 
-    # --- Axis ranges: headroom scales with bracket rows so nothing overlaps ----
+    # --- Axis range: keep the PRICE filling most of the chart (brought up),
+    # leaving just enough top room for the bracket rows.
     ys = [v for v in close.values if v is not None]
     ys += [r[1] for r in comp] + [r[1] for r in proj]
     ys += [y for y in (_num(l.get("price")) for l in levels) if y]
@@ -1332,13 +1338,18 @@ def build_ew_report_chart(wk, data: dict, window_start=None,
     ys = [y for y in ys if y is not None and (not log or y > 0)]
     if ys:
         ymin, ymax = min(ys), max(ys)
+        # Fraction of the vertical the price/levels should occupy (rest = brackets).
+        data_frac = min(0.90, max(0.60, 1.0 - (0.06 + dz * n_rows + 0.03)))
         if log:
             import math
-            m = 1.4 + 0.42 * n_rows                 # more top room per bracket row
-            yr = [math.log10(ymin * 0.82), math.log10(ymax * m)]
+            lmin, lmax = math.log10(ymin), math.log10(ymax)
+            lr = (lmax - lmin) or 0.5
+            r0 = lmin - lr * 0.06
+            yr = [r0, r0 + lr / data_frac]
         else:
-            pad = (ymax - ymin) or (ymax * 0.1) or 1.0
-            yr = [ymin - pad * 0.15, ymax + pad * (0.30 + 0.26 * n_rows)]
+            rng = (ymax - ymin) or (ymax * 0.1) or 1.0
+            r0 = ymin - rng * 0.06
+            yr = [r0, r0 + rng / data_frac]
     else:
         yr = None
 
@@ -1348,11 +1359,12 @@ def build_ew_report_chart(wk, data: dict, window_start=None,
     zoomed = window_start is not None
 
     fig.update_layout(
-        height=560 if zoomed else 860,
-        margin=dict(l=16, r=150, t=104, b=28),
-        legend=dict(orientation="h", y=1.055, x=0, font=dict(size=12),
-                    bgcolor="rgba(255,255,255,0.9)"),
-        title=dict(text=title, x=0.01, y=0.99, font=dict(size=18, color="#0f172a")),
+        height=580 if zoomed else 880,
+        margin=dict(l=16, r=150, t=56, b=60),
+        # Legend at the BOTTOM so it never collides with the top degree brackets.
+        legend=dict(orientation="h", yanchor="top", y=-0.10, x=0,
+                    font=dict(size=12), bgcolor="rgba(255,255,255,0.9)"),
+        title=dict(text=title, x=0.01, y=0.975, font=dict(size=18, color="#0f172a")),
         yaxis=dict(type="log" if log else "linear", showgrid=True,
                    gridcolor="rgba(0,0,0,0.08)", tickprefix="$",
                    tickfont=dict(size=12, color="#1e293b"),
