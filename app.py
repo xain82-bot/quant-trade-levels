@@ -761,6 +761,36 @@ def fetch_ew_history(params: dict, timeframe: str):
     return wk["Close"], name, sym, len(wk)
 
 
+def fetch_ew_history_ticker(ticker: str, timeframe: str):
+    """Fetch history for a raw symbol (used by the image flow after Claude
+    identifies the instrument). Tries Yahoo, then Yahoo `.KA`, then PSX."""
+    t = ticker.strip().upper()
+    tries = [t]
+    if not t.endswith(".KA"):
+        tries.append(t + ".KA")
+    for sym in tries:
+        try:
+            df = load_price_data(sym, "max")
+            wk = _resample(df, timeframe)
+            if len(wk) >= 40:
+                return wk["Close"], load_ticker_name(sym), sym, len(wk)
+        except Exception:
+            continue
+    # PSX Data Portal (indices like ALLSHR, or close-only stocks)
+    try:
+        df = load_psx_data(t, "5y")
+        wk = _resample(df, timeframe)
+        if len(wk) >= 40:
+            return wk["Close"], PSX_INDICES.get(t, t), t, len(wk)
+    except Exception:
+        pass
+    raise ValueError(
+        f"Could not fetch enough history for '{ticker}'. Enter a valid Yahoo "
+        f"ticker (e.g. AUTL, AAPL), a PSX symbol (e.g. SNGP.KA), or a PSX index "
+        f"(e.g. ALLSHR, KSE100)."
+    )
+
+
 _DEEP_EW_SCHEMA = """
 Return ONLY one valid JSON object (no markdown/code fences) shaped EXACTLY:
 
@@ -1263,6 +1293,7 @@ def render_sidebar() -> dict:
             "PSX Stock (KSE All Share)",
             "PSX Index (KSE indices)",
             "Upload CSV (any instrument)",
+            "AI Chart Image Analysis",
         ],
         index=0,
         help=(
@@ -1270,18 +1301,26 @@ def render_sidebar() -> dict:
             "PSX Stock: pick any KSE All Share constituent — OHLC candles from "
             "Yahoo where available, else PSX Data Portal close-only. "
             "PSX Index: official KSE indices incl. the All Share aggregate. "
-            "Upload CSV: any history exported from Investing.com / TradingView."
+            "Upload CSV: any history exported from Investing.com / TradingView. "
+            "AI Chart Image Analysis: upload a chart screenshot for Claude vision "
+            "analysis (Descriptive TA, Position Sizing, Deep Elliott Wave)."
         ),
     )
     is_psx_stock = source.startswith("PSX Stock")
     is_psx = source.startswith("PSX Index")
     is_csv = source.startswith("Upload")
+    is_image = source.startswith("AI Chart Image")
 
     ticker = "NVDA"
     csv_label = "KSE All Share Index"
     uploaded_file = None
     psx_symbol = "ALLSHR"
     psx_stock_symbol = None
+    chart_image = None
+    ai_model = list(AI_MODELS.values())[0]
+    api_key = ""
+    account_size = 10000.0
+    risk_pct = 1.0
 
     if is_psx_stock:
         try:
@@ -1334,78 +1373,71 @@ def render_sidebar() -> dict:
                 "automatically. Only a Date + Close/Price column are strictly "
                 "required."
             )
+    elif is_image:
+        chart_image = st.sidebar.file_uploader(
+            "Upload a chart image (any timeframe)",
+            type=["png", "jpg", "jpeg", "webp"],
+            help="Screenshot from any platform. Claude vision analyses it into "
+                 "the three tabs in the main window.",
+        )
+        ai_model_label = st.sidebar.selectbox(
+            "Analysis model", options=list(AI_MODELS.keys()), index=0,
+        )
+        ai_model = AI_MODELS[ai_model_label]
+
+        # API key — Streamlit secrets if present, else a password field ("Both").
+        try:
+            api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            api_key = ""
+        if api_key and "REPLACE" in api_key:  # ignore the shipped placeholder
+            api_key = ""
+        if api_key:
+            st.sidebar.caption("🔑 Using API key from Streamlit secrets.")
+        else:
+            api_key = st.sidebar.text_input(
+                "Anthropic API Key", type="password",
+                help="Get one at console.anthropic.com. Kept in this session "
+                     "only; never committed. Or set ANTHROPIC_API_KEY in secrets.",
+            ).strip()
+
+        with st.sidebar.expander("💰 Position-sizing inputs"):
+            account_size = st.number_input(
+                "Account size", min_value=0.0, value=10000.0, step=500.0,
+                help="Total trading capital (used in the Position Sizing tab).",
+            )
+            risk_pct = st.slider(
+                "Risk per trade (%)", 0.1, 5.0, 1.0, 0.1,
+                help="Percent of account risked if the stop is hit.",
+            )
     else:
         ticker = st.sidebar.text_input(
             "Ticker Symbol", value="NVDA",
             help="e.g. NVDA, AAPL, MSFT, TSLA — or PSX stocks like HBL.KA, LUCK.KA",
         ).strip().upper()
 
-    period_label = st.sidebar.selectbox(
-        "Lookback Period",
-        options=list(PERIOD_OPTIONS.keys()),
-        index=1,  # default 1 Year
-        disabled=is_csv,
-        help=(
-            "Applies to Yahoo and PSX Data Portal. "
-            "CSV mode uses the file's full range."
-        ),
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("📐 Risk Parameters")
-
-    atr_mult = st.sidebar.slider(
-        "ATR Stop-Loss Multiplier", 1.0, 3.0, 1.5, 0.1,
-        help="Stop = S1 − (multiplier × ATR14)",
-    )
-    rr_tp1 = st.sidebar.slider(
-        "Risk:Reward for TP1", 1.0, 3.0, 1.5, 0.1,
-    )
-    rr_tp2 = st.sidebar.slider(
-        "Risk:Reward for TP2", 2.0, 5.0, 3.0, 0.1,
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🖼️ AI Chart Image Analysis")
-    chart_image = st.sidebar.file_uploader(
-        "Upload a chart image (any timeframe)",
-        type=["png", "jpg", "jpeg", "webp"],
-        help="Screenshot from any platform. Analyzed by Claude vision into the "
-             "three tabs shown in the main panel.",
-    )
-    ai_model_label = st.sidebar.selectbox(
-        "Analysis model", options=list(AI_MODELS.keys()), index=0,
-    )
-    ai_model = AI_MODELS[ai_model_label]
-
-    # API key — Streamlit secrets if present, else a password field ("Both").
-    api_key = ""
-    try:
-        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-    except Exception:
-        api_key = ""
-    # Ignore the shipped placeholder so the input still shows until a real key is set.
-    if api_key and "REPLACE" in api_key:
-        api_key = ""
-    key_from_secrets = bool(api_key)
-    if key_from_secrets:
-        st.sidebar.caption("🔑 Using API key from Streamlit secrets.")
-    else:
-        api_key = st.sidebar.text_input(
-            "Anthropic API Key", type="password",
-            help="Get one at console.anthropic.com. Kept in this session only; "
-                 "never committed. Or set ANTHROPIC_API_KEY in Streamlit secrets.",
-        ).strip()
-
-    with st.sidebar.expander("💰 Position-sizing inputs"):
-        account_size = st.number_input(
-            "Account size", min_value=0.0, value=10000.0, step=500.0,
-            help="Total trading capital (used in the Position Sizing tab).",
+    # Lookback + risk parameters apply only to the live-data sources.
+    period_label = list(PERIOD_OPTIONS.keys())[1]  # default 1 Year
+    atr_mult, rr_tp1, rr_tp2 = 1.5, 1.5, 3.0
+    if not is_image:
+        period_label = st.sidebar.selectbox(
+            "Lookback Period",
+            options=list(PERIOD_OPTIONS.keys()),
+            index=1,  # default 1 Year
+            disabled=is_csv,
+            help=(
+                "Applies to Yahoo and PSX Data Portal. "
+                "CSV mode uses the file's full range."
+            ),
         )
-        risk_pct = st.slider(
-            "Risk per trade (%)", 0.1, 5.0, 1.0, 0.1,
-            help="Percent of account risked if the stop is hit.",
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("📐 Risk Parameters")
+        atr_mult = st.sidebar.slider(
+            "ATR Stop-Loss Multiplier", 1.0, 3.0, 1.5, 0.1,
+            help="Stop = S1 − (multiplier × ATR14)",
         )
+        rr_tp1 = st.sidebar.slider("Risk:Reward for TP1", 1.0, 3.0, 1.5, 0.1)
+        rr_tp2 = st.sidebar.slider("Risk:Reward for TP2", 2.0, 5.0, 3.0, 0.1)
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
@@ -1417,6 +1449,7 @@ def render_sidebar() -> dict:
         "is_psx_stock": is_psx_stock,
         "is_psx": is_psx,
         "is_csv": is_csv,
+        "is_image": is_image,
         "ticker": ticker,
         "psx_symbol": psx_symbol,
         "psx_stock_symbol": psx_stock_symbol,
@@ -1608,13 +1641,19 @@ def _as_float(v):
 
 
 def render_image_analysis(params: dict) -> None:
-    """Render the 3-tab AI analysis of an uploaded chart image. Renders nothing
-    unless an image is uploaded, so the existing dashboard is untouched otherwise."""
+    """Full-page 3-tab AI analysis of an uploaded chart image (its own data
+    source). Descriptive TA + Position Sizing come from the image; the Elliott
+    Wave tab runs the data-driven Deep Elliott Wave report."""
+    st.markdown("## 🖼️ AI Chart Image Analysis")
     image_file = params.get("chart_image")
     if image_file is None:
+        st.info(
+            "👈 Upload a chart image in the sidebar to begin. Claude vision will "
+            "produce three tabs: **Descriptive TA**, **Position Sizing**, and a "
+            "data-driven **Deep Elliott Wave** analysis of the detected instrument."
+        )
         return
 
-    st.markdown("## 🖼️ AI Chart Image Analysis")
     img_bytes = image_file.getvalue()
     media_type = image_file.type or "image/png"
     img_key = _hashlib.sha1(img_bytes).hexdigest()[:16] + "|" + params["ai_model"]
@@ -1744,64 +1783,90 @@ def _render_analysis_tabs(
         if ps.get("notes"):
             st.info(ps["notes"])
 
-    # --- Tab 3: Elliott Wave --------------------------------------------------
+    # --- Tab 3: Deep Elliott Wave (data-driven, on the detected instrument) ---
     with t3:
-        ew = data.get("elliott", {}) or {}
-        stype = str(ew.get("structure_type", "")).lower()
-        cols = st.columns(2)
-        cols[0].markdown(f"**Structure:** {ew.get('structure_type', '—')}")
-        cols[1].markdown(f"**Wave degree:** {ew.get('degree', '—')}")
-        if stype == "unclear":
-            st.warning(
-                "The model judged the visible structure as not a clean, "
-                "rule-compliant Elliott pattern — treat the count below as a "
-                "tentative read, not a definitive labelling."
-            )
-        st.write(ew.get("narrative", ""))
-
-        fig = build_wave_overlay_chart(img_bytes, media_type, ew)
-        if fig is not None:
-            st.plotly_chart(fig, use_container_width=True,
-                            config={"displayModeBar": False})
-            st.caption(
-                "Cyan = completed wave count drawn on your chart; dotted amber = "
-                "expected next waves. Positions are the model's best visual read."
-            )
-        else:
-            st.caption("No wave pivots were returned to draw an overlay.")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Completed waves**")
-            for w in ew.get("current_waves") or []:
-                st.markdown(f"- **{w.get('label', '')}** — {w.get('description', '')}")
-        with c2:
-            st.markdown("**Expected next waves**")
-            for w in ew.get("next_waves") or []:
-                st.markdown(f"- **{w.get('label', '')}** — {w.get('description', '')}")
-
-        rc = ew.get("rules_check") or []
-        if rc:
-            st.markdown("**Elliott Wave rule compliance**")
-            rows = []
-            for r in rc:
-                status = str(r.get("status", ""))
-                icon = {"Pass": "✅", "Fail": "❌", "N/A": "➖"}.get(status, "")
-                rows.append({
-                    "Rule": r.get("rule", ""),
-                    "Status": f"{icon} {status}",
-                    "Detail": r.get("detail", ""),
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        cols = st.columns(2)
-        cols[0].markdown(f"**Invalidation:** {ew.get('invalidation', '—')}")
-        cols[1].markdown(f"**Target zone(s):** {ew.get('targets', '—')}")
+        _render_deep_ew_from_image(data, params)
 
     st.caption(
         "AI analysis is probabilistic and for education only — not financial "
         "advice. Verify levels against your own charting."
     )
+
+
+def _render_deep_ew_from_image(data: dict, params: dict) -> None:
+    """Elliott Wave tab: fetch the detected instrument's real history and run the
+    rigorous multi-degree Deep Elliott Wave report on it (graphs, rule tables,
+    Fibonacci targets, projected path)."""
+    guess = str(data.get("instrument_guess", "")).strip()
+    tf_guess = str(data.get("timeframe_guess", "")).strip()
+    st.caption(
+        f"Detected from image → instrument: **{guess or 'Unknown'}**, timeframe: "
+        f"**{tf_guess or 'Unknown'}**. The report below fetches this instrument's "
+        f"real history and runs a multi-degree Elliott Wave analysis on it."
+    )
+
+    if not params.get("api_key"):
+        st.info("Add your Anthropic API key in the sidebar to run the report.")
+        return
+
+    # Suggest a symbol only when the guess already looks like a ticker.
+    sym_suggest = guess if (guess and " " not in guess
+                            and guess.lower() != "unknown" and len(guess) <= 12) else ""
+    tf_default = 0 if ("w" in tf_guess.lower() or tf_guess == "") else 1
+
+    c = st.columns([1.2, 1, 1])
+    ticker = c[0].text_input(
+        "Fetch ticker / symbol", value=sym_suggest, key="img_ew_ticker",
+        help="Yahoo ticker (AUTL, AAPL), PSX symbol (SNGP.KA) or PSX index "
+             "(ALLSHR). Edit if the auto-detected name isn't a valid symbol.",
+    ).strip().upper()
+    timeframe = c[1].selectbox("Timeframe", ["Weekly", "Daily"], index=tf_default,
+                               key="img_ew_tf")
+    sens = c[2].slider("Swing sensitivity (%)", 3, 15, 8, key="img_ew_sens") / 100.0
+
+    if not ticker:
+        st.info(
+            "Enter the instrument's ticker/symbol above and click Run. (The name "
+            "read from the image may not be a valid data symbol.)"
+        )
+        return
+
+    run = st.button("🌊 Run Deep Elliott Wave", type="primary", key="img_ew_run")
+    ckey = f"{ticker}|{timeframe}|{sens}|{params['ai_model']}"
+    store = st.session_state.setdefault("_ew_report", {})
+
+    if run and ckey not in store:
+        try:
+            with st.spinner(
+                "Fetching full history and running multi-degree Elliott Wave "
+                "analysis… (Opus 5 thinks for ~30–60s)"
+            ):
+                close, name, symbol, n = fetch_ew_history_ticker(ticker, timeframe)
+                pivots = zigzag_pivots(close, sens)
+                if len(pivots) < 5:
+                    st.warning(
+                        "Too few swing pivots at this sensitivity — lower the % "
+                        "or try Weekly with a longer history."
+                    )
+                    return
+                d = deep_elliott_analysis(
+                    name, symbol, timeframe, pivots, float(close.iloc[-1]), n,
+                    params["ai_model"], params["api_key"],
+                )
+                store[ckey] = {"data": d, "close": close, "name": name,
+                               "symbol": symbol, "n": n}
+        except (RuntimeError, ValueError) as e:
+            st.error(f"❌ {e}")
+            return
+        except Exception as e:  # pragma: no cover
+            st.error(f"❌ Unexpected error: {e}")
+            return
+
+    bundle = store.get(ckey)
+    if bundle:
+        _render_ew_report(bundle)
+    elif not run:
+        st.caption("Confirm the ticker and click **Run Deep Elliott Wave**.")
 
 
 def render_deep_ew(params: dict) -> None:
@@ -1973,11 +2038,12 @@ def main() -> None:
 
     params = render_sidebar()
 
-    # --- New feature: AI chart-image analysis (shown only when an image is
-    # uploaded; the existing live-data dashboard below is left untouched). -----
-    if params.get("chart_image") is not None:
+    # --- AI Chart Image Analysis is its own data source: it takes over the main
+    # window with only the three analysis tabs, and the live-data dashboard is
+    # not rendered at all. ------------------------------------------------------
+    if params["is_image"]:
         render_image_analysis(params)
-        st.markdown("---")
+        return
 
     # --- Data acquisition, branched by source --------------------------------
     if params["is_psx_stock"]:
