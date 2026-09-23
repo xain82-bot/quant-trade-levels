@@ -1183,8 +1183,8 @@ def build_ew_report_chart(wk, data: dict) -> "go.Figure":
             texts.append(f"<b>{lab}</b><br>${y:,.3f}")
         fig.add_trace(go.Scatter(
             x=cx, y=cy, mode="markers+text", text=texts, textposition=positions,
-            textfont=dict(size=10.5, color="#1e293b"),
-            marker=dict(size=7, color=C_LINE, line=dict(width=1.4, color="#fff")),
+            textfont=dict(size=9, color="#0f172a"),
+            marker=dict(size=6, color=C_LINE, line=dict(width=1.2, color="#fff")),
             name="Wave pivots", showlegend=False, cliponaxis=False))
 
     # --- Projected path into the future.
@@ -1204,11 +1204,14 @@ def build_ew_report_chart(wk, data: dict) -> "go.Figure":
         px_ = [start[0]] + [r[0] for r in proj]
         py_ = [start[1]] + [r[1] for r in proj]
         pt_ = [""] + [r[2] for r in proj]
+        # Alternate label side to reduce overlap when targets bunch up.
+        pos = ["middle center"] + [("top center" if i % 2 == 0 else "bottom center")
+                                   for i in range(len(proj))]
         fig.add_trace(go.Scatter(
             x=px_, y=py_, mode="lines+markers+text", text=pt_,
-            textposition="top center", textfont=dict(size=10.5, color=C_PROJ),
-            line=dict(color=C_PROJ, width=2.2, dash="dash"),
-            marker=dict(size=8, color="#fff", line=dict(width=2, color=C_PROJ),
+            textposition=pos, textfont=dict(size=9, color="#b45309"),
+            line=dict(color=C_PROJ, width=2, dash="dash"),
+            marker=dict(size=6, color="#fff", line=dict(width=1.6, color=C_PROJ),
                         symbol="circle"),
             name="Projected path", cliponaxis=False))
 
@@ -1267,26 +1270,36 @@ def build_ew_report_chart(wk, data: dict) -> "go.Figure":
                                   line=dict(color="#16A34A", width=1)),
                       name="Retracement grid"))
 
-    # --- Degree brackets INSIDE the top of the plot (paper-y rows).
-    y_rows = [0.955, 0.895]
+    # --- Degree brackets, auto-stacked so overlapping spans get separate rows.
+    brs = []
     for b in data.get("degree_brackets") or []:
         s = pd.to_datetime(b.get("start"), errors="coerce")
         e = pd.to_datetime(b.get("end"), errors="coerce")
         if pd.isna(s) or pd.isna(e):
             continue
-        color = "#EA7317" if str(b.get("color", "")).lower().startswith("or") else "#2B6CB0"
-        yy = y_rows[min(int(b.get("row", 0) or 0), len(y_rows) - 1)]
+        if e < s:
+            s, e = e, s
+        col = "#EA7317" if str(b.get("color", "")).lower().startswith("or") else "#2B6CB0"
+        brs.append((s, e, str(b.get("label", "")), col))
+    brs.sort(key=lambda r: r[0])
+    # One bracket per row → labels can never collide horizontally.
+    placed = [(s, e, lab, col, i) for i, (s, e, lab, col) in enumerate(brs)]
+    n_rows = max(len(brs), 1)
+    top_y, dz = 0.985, 0.052
+    for s, e, lab, col, ri in placed:
+        yy = top_y - ri * dz
         fig.add_shape(type="line", x0=s, x1=e, xref="x", y0=yy, y1=yy, yref="paper",
-                      line=dict(color=color, width=1.4), layer="above")
-        for xx in (s, e):  # downward end ticks
+                      line=dict(color=col, width=1.6), layer="above")
+        for xx in (s, e):
             fig.add_shape(type="line", x0=xx, x1=xx, xref="x",
-                          y0=yy, y1=yy - 0.02, yref="paper",
-                          line=dict(color=color, width=1.4), layer="above")
-        fig.add_annotation(x=s + (e - s) / 2, y=yy + 0.006, xref="x", yref="paper",
-                           text=f"<b>{b.get('label', '')}</b>", showarrow=False,
-                           font=dict(size=10, color=color), yanchor="bottom")
+                          y0=yy, y1=yy - 0.014, yref="paper",
+                          line=dict(color=col, width=1.6), layer="above")
+        fig.add_annotation(x=s, y=yy + 0.004, xref="x", yref="paper",
+                           text=f"<b>{lab}</b>", showarrow=False,
+                           xanchor="left", yanchor="bottom",
+                           font=dict(size=9, color=col))
 
-    # --- Axis ranges with generous headroom so labels never clip / overlap ----
+    # --- Axis ranges: headroom scales with bracket rows so nothing overlaps ----
     ys = [v for v in close.values if v is not None]
     ys += [r[1] for r in comp] + [r[1] for r in proj]
     ys += [y for y in (_num(l.get("price")) for l in levels) if y]
@@ -1299,33 +1312,34 @@ def build_ew_report_chart(wk, data: dict) -> "go.Figure":
         ymin, ymax = min(ys), max(ys)
         if log:
             import math
-            yr = [math.log10(ymin * 0.80), math.log10(ymax * 1.35)]
+            m = 1.4 + 0.42 * n_rows                 # more top room per bracket row
+            yr = [math.log10(ymin * 0.82), math.log10(ymax * m)]
         else:
             pad = (ymax - ymin) or (ymax * 0.1) or 1.0
-            yr = [ymin - pad * 0.18, ymax + pad * 0.30]  # extra top headroom
+            yr = [ymin - pad * 0.15, ymax + pad * (0.30 + 0.26 * n_rows)]
     else:
         yr = None
 
     xmin = close.index[0]
     span = (right - xmin) or (close.index[-1] - close.index[0])
-    xmax = right + span * 0.07  # right padding for projected labels
+    xmax = right + span * 0.10  # right padding for projected labels
 
     fig.update_layout(
-        template="plotly_white", height=760,
-        margin=dict(l=14, r=140, t=92, b=24),
-        legend=dict(orientation="h", y=1.09, x=0, font=dict(size=11),
-                    bgcolor="rgba(0,0,0,0)"),
-        title=dict(text="Primary degree — where we actually are", x=0.01,
-                   y=0.985, font=dict(size=17, color="#0f172a")),
+        height=860, margin=dict(l=16, r=150, t=104, b=28),
+        legend=dict(orientation="h", y=1.055, x=0, font=dict(size=12),
+                    bgcolor="rgba(255,255,255,0.9)"),
+        title=dict(text="Elliott Wave Map — completed count & projected path",
+                   x=0.01, y=0.99, font=dict(size=18, color="#0f172a")),
         yaxis=dict(type="log" if log else "linear", showgrid=True,
-                   gridcolor="rgba(0,0,0,0.06)", tickprefix="$",
-                   tickfont=dict(size=11.5, color="#334155"),
+                   gridcolor="rgba(0,0,0,0.08)", tickprefix="$",
+                   tickfont=dict(size=12, color="#1e293b"),
+                   title=dict(text="Price", font=dict(size=12, color="#475569")),
                    range=yr),
         xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)",
-                   tickfont=dict(size=11.5, color="#334155"),
+                   tickfont=dict(size=12, color="#1e293b"),
                    range=[xmin, xmax]),
-        plot_bgcolor="white", paper_bgcolor="rgba(0,0,0,0)",
-        hovermode="x unified", dragmode=False,
+        plot_bgcolor="white", paper_bgcolor="white",   # solid light card
+        hovermode="x unified", dragmode=False, font=dict(color="#1e293b"),
     )
     return fig
 
