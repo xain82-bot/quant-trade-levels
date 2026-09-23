@@ -484,38 +484,68 @@ def analyze_chart_image(
         + _ANALYSIS_SCHEMA_HINT
     )
 
-    try:
-        resp = client.messages.create(
-            model=model,
-            max_tokens=8000,
-            system=_ANALYSIS_SYSTEM,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": b64,
-                            },
+    create_kwargs = dict(
+        model=model,
+        max_tokens=16000,
+        system=_ANALYSIS_SYSTEM,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64,
                         },
-                        {"type": "text", "text": user_text},
-                    ],
-                }
-            ],
-        )
+                    },
+                    {"type": "text", "text": user_text},
+                ],
+            }
+        ],
+    )
+    # Structured extraction — turn OFF extended thinking so the whole token
+    # budget goes to the JSON answer (adaptive thinking can otherwise exhaust
+    # max_tokens before any text is produced). Both Sonnet 5 and Opus 5 accept
+    # disabled thinking at the default effort.
+    try:
+        resp = client.messages.create(thinking={"type": "disabled"}, **create_kwargs)
     except anthropic.AuthenticationError as e:
         raise RuntimeError("Anthropic rejected the API key (authentication error).") from e
     except anthropic.RateLimitError as e:
         raise RuntimeError("Anthropic rate limit hit — wait a moment and retry.") from e
+    except anthropic.BadRequestError:
+        # Some models reject explicit disabling — retry without the param.
+        try:
+            resp = client.messages.create(**create_kwargs)
+        except anthropic.APIStatusError as e:
+            raise RuntimeError(f"Anthropic API error ({e.status_code}): {e.message}") from e
     except anthropic.APIStatusError as e:
         raise RuntimeError(f"Anthropic API error ({e.status_code}): {e.message}") from e
     except anthropic.APIConnectionError as e:
         raise RuntimeError("Could not reach Anthropic — check your connection.") from e
 
-    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    stop = getattr(resp, "stop_reason", None)
+    if stop == "refusal":
+        raise RuntimeError(
+            "Claude declined to analyze this image. Try a clearer chart "
+            "screenshot without any overlaid instructions or text."
+        )
+
+    text = "".join(
+        b.text for b in resp.content if getattr(b, "type", "") == "text"
+    ).strip()
+
+    if not text:
+        if stop == "max_tokens":
+            raise ValueError(
+                "The analysis was cut off before completing (max_tokens). "
+                "Try again, or switch to a simpler/clearer chart."
+            )
+        raise ValueError(
+            f"The model returned no text (stop_reason={stop!r}). Please retry."
+        )
     return _parse_analysis_json(text)
 
 
