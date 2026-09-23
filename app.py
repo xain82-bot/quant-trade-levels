@@ -1132,10 +1132,16 @@ def _num(v):
         return None
 
 
-def build_ew_report_chart(wk, data: dict) -> "go.Figure":
+def build_ew_report_chart(wk, data: dict, window_start=None,
+                          title="Elliott Wave Map — completed count & projected path"
+                          ) -> "go.Figure":
     """Editorial 'wave map': weekly close with a soft range band, price-labelled
     pivots, degree brackets across the top, dashed reference levels, an orange
-    dashed projected path into a shaded future zone, and a retracement grid."""
+    dashed projected path into a shaded future zone, and a retracement grid.
+
+    When `window_start` is given, the view is zoomed to that date onward (the
+    price line, pivots and brackets are trimmed to the window) — used for the
+    'recent swings' companion chart."""
     if isinstance(wk, pd.Series):
         close = wk
         band = None
@@ -1144,9 +1150,19 @@ def build_ew_report_chart(wk, data: dict) -> "go.Figure":
         band = wk if ("High" in wk.columns and "Low" in wk.columns
                       and bool((wk["High"] != wk["Low"]).any())) else None
 
+    full_last = close.index[-1]
+    if window_start is not None:
+        window_start = pd.Timestamp(window_start)
+        close = close[close.index >= window_start]
+        if band is not None:
+            band = band[band.index >= window_start]
+        if len(close) < 3:              # too little in-window data → skip zoom
+            window_start = None
+
     C_LINE = "#2B6CB0"     # weekly close (blue)
     C_PROJ = "#E4572E"     # projected path (orange)
-    log = bool(data.get("use_log_scale"))
+    # Log only on the full multi-year view; the 1-year zoom reads better linear.
+    log = bool(data.get("use_log_scale")) and window_start is None
     fig = go.Figure()
 
     # Soft high–low band behind the close line.
@@ -1169,6 +1185,8 @@ def build_ew_report_chart(wk, data: dict) -> "go.Figure":
         d = pd.to_datetime(p.get("date"), errors="coerce")
         y = _num(p.get("price"))
         if pd.isna(d) or y is None:
+            continue
+        if window_start is not None and d < window_start:
             continue
         comp.append((d, y, str(p.get("label", ""))))
     comp.sort(key=lambda r: r[0])
@@ -1279,6 +1297,10 @@ def build_ew_report_chart(wk, data: dict) -> "go.Figure":
             continue
         if e < s:
             s, e = e, s
+        if window_start is not None:
+            if e < window_start:        # bracket entirely before the window
+                continue
+            s = max(s, window_start)    # clamp start into view
         col = "#EA7317" if str(b.get("color", "")).lower().startswith("or") else "#2B6CB0"
         brs.append((s, e, str(b.get("label", "")), col))
     brs.sort(key=lambda r: r[0])
@@ -1320,16 +1342,17 @@ def build_ew_report_chart(wk, data: dict) -> "go.Figure":
     else:
         yr = None
 
-    xmin = close.index[0]
+    xmin = window_start if window_start is not None else close.index[0]
     span = (right - xmin) or (close.index[-1] - close.index[0])
     xmax = right + span * 0.10  # right padding for projected labels
+    zoomed = window_start is not None
 
     fig.update_layout(
-        height=860, margin=dict(l=16, r=150, t=104, b=28),
+        height=560 if zoomed else 860,
+        margin=dict(l=16, r=150, t=104, b=28),
         legend=dict(orientation="h", y=1.055, x=0, font=dict(size=12),
                     bgcolor="rgba(255,255,255,0.9)"),
-        title=dict(text="Elliott Wave Map — completed count & projected path",
-                   x=0.01, y=0.99, font=dict(size=18, color="#0f172a")),
+        title=dict(text=title, x=0.01, y=0.99, font=dict(size=18, color="#0f172a")),
         yaxis=dict(type="log" if log else "linear", showgrid=True,
                    gridcolor="rgba(0,0,0,0.08)", tickprefix="$",
                    tickfont=dict(size=12, color="#1e293b"),
@@ -2366,11 +2389,30 @@ def _render_ew_report(bundle: dict) -> None:
         html.append("</div>")
         st.markdown("".join(html), unsafe_allow_html=True)
 
-    # Projection chart
+    # Projection chart (full history)
     st.plotly_chart(
         build_ew_report_chart(wk, data), use_container_width=True,
         config={"displayModeBar": False},
     )
+
+    # Zoomed companion chart — last 12 months, to read the latest swings clearly.
+    try:
+        last_dt = close.index[-1]
+        win_start = last_dt - pd.Timedelta(days=365)
+        if (close.index >= win_start).sum() >= 8:
+            st.markdown("#### 🔍 Recent swings — last 12 months (zoomed)")
+            st.plotly_chart(
+                build_ew_report_chart(
+                    wk, data, window_start=win_start,
+                    title="Recent swings — last 12 months (zoomed)"),
+                use_container_width=True, config={"displayModeBar": False},
+            )
+            st.caption(
+                "Same count and projected path as above, zoomed to the latest "
+                "year (linear scale) so the current cycle/moves are easy to read."
+            )
+    except Exception:
+        pass
 
     # === 1. STRICT RULE VERIFICATION =========================================
     st.markdown("### 1 · Strict Rule Verification")
