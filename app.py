@@ -759,7 +759,7 @@ def fetch_ew_history(params: dict, timeframe: str):
             f"Only {len(wk)} {timeframe.lower()} bars available — need at least 40 "
             f"for a multi-degree count. Try the Daily timeframe or a longer history."
         )
-    return wk["Close"], name, sym, len(wk)
+    return wk, name, sym, len(wk)
 
 
 def fetch_ew_history_ticker(ticker: str, timeframe: str):
@@ -774,7 +774,7 @@ def fetch_ew_history_ticker(ticker: str, timeframe: str):
             df = load_price_data(sym, "max")
             wk = _resample(df, timeframe)
             if len(wk) >= 40:
-                return wk["Close"], load_ticker_name(sym), sym, len(wk)
+                return wk, load_ticker_name(sym), sym, len(wk)
         except Exception:
             continue
     # PSX Data Portal (indices like ALLSHR, or close-only stocks)
@@ -782,7 +782,7 @@ def fetch_ew_history_ticker(ticker: str, timeframe: str):
         df = load_psx_data(t, "5y")
         wk = _resample(df, timeframe)
         if len(wk) >= 40:
-            return wk["Close"], PSX_INDICES.get(t, t), t, len(wk)
+            return wk, PSX_INDICES.get(t, t), t, len(wk)
     except Exception:
         pass
     raise ValueError(
@@ -864,6 +864,17 @@ Return ONLY one valid JSON object (no markdown/code fences) shaped EXACTLY:
   "invalidation_note":"exact price TO THE PENNY where the primary count fails, and why",
   "alternative_count": {"trigger":"e.g. 'if price < $1.38'","description":"the most probable alternative, e.g. a complex W-X-Y correction"},
 
+  "degree_brackets": [
+    {"label":"PRIMARY 1 - 15 wks","start":"YYYY-MM-DD","end":"YYYY-MM-DD","color":"blue","row":0},
+    {"label":"PRIMARY 2 - running double three - 52 wks","start":"YYYY-MM-DD","end":"YYYY-MM-DD","color":"blue","row":0},
+    {"label":"PRIMARY 3 - in progress","start":"YYYY-MM-DD","end":"YYYY-MM-DD","color":"orange","row":0}
+  ],
+  "horizontal_levels": [
+    {"price": 1.3800, "label":"INVALID $1.3800", "style":"invalidation"},
+    {"price": 2.7000, "label":"Primary 4 floor $2.7000", "style":"floor"},
+    {"price": 1.1050, "label":"terminal $1.1050", "style":"terminal"}
+  ],
+
   "cards": [{"label":"POSITION","value":"...","sub":"..."}],
   "narrative": ["professional paragraph 1", "paragraph 2", "..."],
   "completed_pivots": [
@@ -887,6 +898,15 @@ Data rules:
   waves use the real pivot dates; 'projected' waves are in the FUTURE with dated
   start/end (contiguous with the last elapsed wave). Cover the current + next few
   waves so the emerging structure's expected timeline is visible.
+- degree_brackets: horizontal spans (start/end dates on the price chart) that
+  label each higher-degree wave/phase across the TOP of the chart, with its
+  duration or key ratio in the label. color 'blue' for completed phases, 'orange'
+  for the in-progress/future phase. Use real pivot dates for completed spans.
+- horizontal_levels: key price levels to draw as dashed horizontal lines with
+  labels. style is 'invalidation' (red), 'floor'/'support' (grey), or 'terminal'
+  (pink). Always include the primary invalidation level here too.
+- completed_pivots: EACH pivot's real price will be shown as a label; keep 'label'
+  short (the wave id, e.g. '3', 'Int (1)', '(Y)').
 """
 
 
@@ -1101,87 +1121,181 @@ def build_wave_timeline_chart(data: dict, close: pd.Series) -> "go.Figure | None
     return fig
 
 
-def build_ew_report_chart(close: pd.Series, data: dict) -> "go.Figure":
-    """Weekly/daily close with labelled completed pivots, dotted projected path,
-    invalidation line and retracement grid — the projection chart of the report."""
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_ew_report_chart(wk, data: dict) -> "go.Figure":
+    """Editorial 'wave map': weekly close with a soft range band, price-labelled
+    pivots, degree brackets across the top, dashed reference levels, an orange
+    dashed projected path into a shaded future zone, and a retracement grid."""
+    if isinstance(wk, pd.Series):
+        close = wk
+        band = None
+    else:
+        close = wk["Close"]
+        band = wk if ("High" in wk.columns and "Low" in wk.columns
+                      and bool((wk["High"] != wk["Low"]).any())) else None
+
+    C_LINE = "#2B6CB0"     # weekly close (blue)
+    C_PROJ = "#E4572E"     # projected path (orange)
+    log = bool(data.get("use_log_scale"))
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=close.index, y=close.values, name="Close",
-            line=dict(color="#4C78D8", width=1.6),
-        )
-    )
 
-    comp = data.get("completed_pivots") or []
-    cx, cy, ct = [], [], []
-    for p in comp:
+    # Soft high–low band behind the close line.
+    if band is not None:
+        fig.add_trace(go.Scatter(
+            x=band.index, y=band["High"], line=dict(width=0),
+            hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(
+            x=band.index, y=band["Low"], fill="tonexty",
+            fillcolor="rgba(43,108,176,0.10)", line=dict(width=0),
+            hoverinfo="skip", showlegend=False))
+
+    fig.add_trace(go.Scatter(
+        x=close.index, y=close.values, name="Weekly close",
+        line=dict(color=C_LINE, width=1.7)))
+
+    # --- Completed pivots: dot + wave label + price (peak above / trough below).
+    comp = []
+    for p in data.get("completed_pivots") or []:
         d = pd.to_datetime(p.get("date"), errors="coerce")
-        y = p.get("price")
-        if pd.isna(d) or y in (None, ""):
+        y = _num(p.get("price"))
+        if pd.isna(d) or y is None:
             continue
-        cx.append(d); cy.append(float(y)); ct.append(str(p.get("label", "")))
-    if cx:
-        fig.add_trace(
-            go.Scatter(
-                x=cx, y=cy, mode="markers+text", text=ct, textposition="top center",
-                textfont=dict(size=11, color="#111"),
-                marker=dict(size=8, color="#E4572E", line=dict(width=1, color="#fff")),
-                name="Completed pivots",
-            )
-        )
+        comp.append((d, y, str(p.get("label", ""))))
+    comp.sort(key=lambda r: r[0])
+    if comp:
+        cx = [r[0] for r in comp]; cy = [r[1] for r in comp]
+        texts, positions = [], []
+        for i, (_, y, lab) in enumerate(comp):
+            prev_y = comp[i - 1][1] if i > 0 else y
+            nxt_y = comp[i + 1][1] if i < len(comp) - 1 else y
+            peak = y >= prev_y and y >= nxt_y
+            positions.append("top center" if peak else "bottom center")
+            texts.append(f"<b>{lab}</b><br>${y:,.3f}")
+        fig.add_trace(go.Scatter(
+            x=cx, y=cy, mode="markers+text", text=texts, textposition=positions,
+            textfont=dict(size=10.5, color="#1e293b"),
+            marker=dict(size=7, color=C_LINE, line=dict(width=1.4, color="#fff")),
+            name="Wave pivots", showlegend=False, cliponaxis=False))
 
-    # Projected path — future dates; if unparseable, sequence forward from last bar.
-    proj = data.get("projected_path") or []
+    # --- Projected path into the future.
     last_date = close.index[-1]
     step = (close.index[-1] - close.index[0]) / max(len(close) - 1, 1)
-    px_, py_, pt_ = [], [], []
-    for k, p in enumerate(proj, 1):
+    proj = []
+    for k, p in enumerate(data.get("projected_path") or [], 1):
         d = pd.to_datetime(p.get("date"), errors="coerce")
         if pd.isna(d) or d <= last_date:
             d = last_date + step * (4 * k)
-        y = p.get("price")
-        if y in (None, ""):
+        y = _num(p.get("price"))
+        if y is None:
             continue
-        px_.append(d); py_.append(float(y)); pt_.append(str(p.get("label", "")))
-    if cx and px_:
-        px_ = [cx[-1]] + px_
-        py_ = [cy[-1]] + py_
-        pt_ = [""] + pt_
-    if px_:
-        fig.add_trace(
-            go.Scatter(
-                x=px_, y=py_, mode="lines+markers+text", text=pt_,
-                textposition="top center", textfont=dict(size=11, color="#E4572E"),
-                line=dict(color="#E4572E", width=2, dash="dash"),
-                marker=dict(size=7, color="#E4572E"),
-                name="Projected path",
-            )
-        )
+        proj.append((d, y, str(p.get("label", ""))))
+    if proj:
+        start = comp[-1][:2] if comp else (last_date, float(close.iloc[-1]))
+        px_ = [start[0]] + [r[0] for r in proj]
+        py_ = [start[1]] + [r[1] for r in proj]
+        pt_ = [""] + [r[2] for r in proj]
+        fig.add_trace(go.Scatter(
+            x=px_, y=py_, mode="lines+markers+text", text=pt_,
+            textposition="top center", textfont=dict(size=10.5, color=C_PROJ),
+            line=dict(color=C_PROJ, width=2.2, dash="dash"),
+            marker=dict(size=8, color="#fff", line=dict(width=2, color=C_PROJ),
+                        symbol="circle"),
+            name="Projected path", cliponaxis=False))
 
-    inv = data.get("invalidation_price")
-    if isinstance(inv, (int, float)) and inv:
-        fig.add_hline(
-            y=float(inv), line=dict(color="#C1121F", width=1.4, dash="dash"),
-            annotation_text=data.get("invalidation_label", f"Invalid {inv}"),
-            annotation_position="right",
-        )
+    # Right edge of the drawing (for the shaded future zone / brackets).
+    right = last_date
+    for r in proj:
+        right = max(right, r[0])
+    for b in data.get("degree_brackets") or []:
+        e = pd.to_datetime(b.get("end"), errors="coerce")
+        if not pd.isna(e):
+            right = max(right, e)
+
+    # --- Shaded future zone + 'now' divider.
+    if right > last_date:
+        fig.add_vrect(x0=last_date, x1=right, fillcolor="#64748b",
+                      opacity=0.06, line_width=0, layer="below")
+    fig.add_vline(x=last_date, line=dict(color="#94a3b8", width=1.2, dash="dot"))
+
+    # --- Horizontal reference levels.
+    style_map = {
+        "invalidation": ("#C1121F", "dash"), "floor": ("#64748b", "dash"),
+        "support": ("#64748b", "dash"), "terminal": ("#DB2777", "dot"),
+    }
+    levels = list(data.get("horizontal_levels") or [])
+    inv = _num(data.get("invalidation_price"))
+    if inv and not any(_num(l.get("price")) == inv for l in levels):
+        levels.append({"price": inv, "label": data.get("invalidation_label",
+                       f"INVALID ${inv}"), "style": "invalidation"})
+    for lv in levels:
+        y = _num(lv.get("price"))
+        if y is None or (log and y <= 0):
+            continue
+        col, dash = style_map.get(str(lv.get("style", "")).lower(),
+                                  ("#64748b", "dash"))
+        fig.add_hline(y=y, line=dict(color=col, width=1.3, dash=dash),
+                      annotation_text=lv.get("label", ""),
+                      annotation_position="right",
+                      annotation_font=dict(size=10, color=col))
+
+    # --- Retracement grid (green box + boundary labels).
     rz = data.get("retracement_zone") or {}
-    lo, hi = rz.get("low"), rz.get("high")
-    if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and lo and hi:
-        fig.add_hrect(
-            y0=min(lo, hi), y1=max(lo, hi), fillcolor="#2E7D32",
-            opacity=0.10, line_width=0,
-            annotation_text=rz.get("label", ""), annotation_position="top left",
-        )
+    lo, hi = _num(rz.get("low")), _num(rz.get("high"))
+    if lo and hi:
+        fig.add_hrect(y0=min(lo, hi), y1=max(lo, hi), fillcolor="#16A34A",
+                      opacity=0.10, line_width=0,
+                      annotation_text=rz.get("label", "retracement grid"),
+                      annotation_position="left",
+                      annotation_font=dict(size=10, color="#15803D"))
+    # Legend proxies (so the key reads like the reference).
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
+                  line=dict(color=C_PROJ, width=2.2, dash="dash"),
+                  name="Projected path", showlegend=False))
+    if lo and hi:
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
+                      marker=dict(size=10, color="rgba(22,163,74,0.25)",
+                                  line=dict(color="#16A34A", width=1)),
+                      name="Retracement grid"))
+
+    # --- Degree brackets INSIDE the top of the plot (paper-y rows).
+    y_rows = [0.955, 0.895]
+    for b in data.get("degree_brackets") or []:
+        s = pd.to_datetime(b.get("start"), errors="coerce")
+        e = pd.to_datetime(b.get("end"), errors="coerce")
+        if pd.isna(s) or pd.isna(e):
+            continue
+        color = "#EA7317" if str(b.get("color", "")).lower().startswith("or") else "#2B6CB0"
+        yy = y_rows[min(int(b.get("row", 0) or 0), len(y_rows) - 1)]
+        fig.add_shape(type="line", x0=s, x1=e, xref="x", y0=yy, y1=yy, yref="paper",
+                      line=dict(color=color, width=1.4), layer="above")
+        for xx in (s, e):  # downward end ticks
+            fig.add_shape(type="line", x0=xx, x1=xx, xref="x",
+                          y0=yy, y1=yy - 0.02, yref="paper",
+                          line=dict(color=color, width=1.4), layer="above")
+        fig.add_annotation(x=s + (e - s) / 2, y=yy + 0.006, xref="x", yref="paper",
+                           text=f"<b>{b.get('label', '')}</b>", showarrow=False,
+                           font=dict(size=9.5, color=color), yanchor="bottom")
 
     fig.update_layout(
-        template="plotly_white", height=560,
-        margin=dict(l=10, r=70, t=40, b=10),
-        legend=dict(orientation="h", y=1.04, x=0, font=dict(size=10)),
-        title=dict(text="Wave map — completed count & projected path", x=0.01,
-                   font=dict(size=14)),
-        yaxis=dict(type="log" if data.get("use_log_scale") else "linear"),
-        dragmode=False,
+        template="plotly_white", height=620,
+        margin=dict(l=12, r=124, t=76, b=18),
+        legend=dict(orientation="h", y=1.10, x=0, font=dict(size=10.5),
+                    bgcolor="rgba(0,0,0,0)"),
+        title=dict(text="Primary degree — where we actually are", x=0.01,
+                   y=0.985, font=dict(size=16, color="#0f172a")),
+        yaxis=dict(type="log" if log else "linear", showgrid=True,
+                   gridcolor="rgba(0,0,0,0.06)", tickprefix="$",
+                   tickfont=dict(size=11, color="#475569")),
+        xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)",
+                   tickfont=dict(size=11, color="#475569")),
+        plot_bgcolor="white", paper_bgcolor="rgba(0,0,0,0)",
+        hovermode="x unified", dragmode=False,
     )
     return fig
 
@@ -2040,7 +2154,8 @@ def _render_deep_ew_from_image(data: dict, params: dict) -> None:
                 "Fetching full history and running multi-degree Elliott Wave "
                 "analysis… (Opus 5 thinks for ~30–60s)"
             ):
-                close, name, symbol, n = fetch_ew_history_ticker(ticker, timeframe)
+                wk, name, symbol, n = fetch_ew_history_ticker(ticker, timeframe)
+                close = wk["Close"]
                 pivots = zigzag_pivots(close, sens)
                 if len(pivots) < 5:
                     st.warning(
@@ -2052,7 +2167,7 @@ def _render_deep_ew_from_image(data: dict, params: dict) -> None:
                     name, symbol, timeframe, pivots, float(close.iloc[-1]), n,
                     params["ai_model"], params["api_key"],
                 )
-                store[ckey] = {"data": d, "close": close, "name": name,
+                store[ckey] = {"data": d, "wk": wk, "close": close, "name": name,
                                "symbol": symbol, "n": n}
         except (RuntimeError, ValueError) as e:
             st.error(f"❌ {e}")
@@ -2108,7 +2223,8 @@ def render_deep_ew(params: dict) -> None:
                 "Fetching full history and running the multi-degree Elliott Wave "
                 "analysis… (Opus 5 thinks for ~30–60s)"
             ):
-                close, name, symbol, n = fetch_ew_history(params, timeframe)
+                wk, name, symbol, n = fetch_ew_history(params, timeframe)
+                close = wk["Close"]
                 pivots = zigzag_pivots(close, sens)
                 if len(pivots) < 5:
                     st.warning(
@@ -2120,7 +2236,7 @@ def render_deep_ew(params: dict) -> None:
                     name, symbol, timeframe, pivots, float(close.iloc[-1]), n,
                     params["ai_model"], params["api_key"],
                 )
-                store[cache_key] = {"data": data, "close": close,
+                store[cache_key] = {"data": data, "wk": wk, "close": close,
                                     "name": name, "symbol": symbol, "n": n}
         except (RuntimeError, ValueError) as e:
             st.error(f"❌ {e}")
@@ -2143,6 +2259,7 @@ _RULE_ICON = {"pass": "✅", "holds": "✅", "fail": "❌", "violated": "❌",
 def _render_ew_report(bundle: dict) -> None:
     data = bundle["data"]
     close = bundle["close"]
+    wk = bundle.get("wk", close)
 
     st.markdown(
         f"### {bundle['name']} ({bundle['symbol']}) — {bundle['n']} bars · "
@@ -2171,7 +2288,7 @@ def _render_ew_report(bundle: dict) -> None:
 
     # Projection chart
     st.plotly_chart(
-        build_ew_report_chart(close, data), use_container_width=True,
+        build_ew_report_chart(wk, data), use_container_width=True,
         config={"displayModeBar": False},
     )
 
