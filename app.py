@@ -679,6 +679,285 @@ def _has_xy(p: dict) -> bool:
 
 
 # -----------------------------------------------------------------------------
+# Deep multi-degree Elliott Wave report (data-driven)
+# -----------------------------------------------------------------------------
+def zigzag_pivots(close: pd.Series, pct: float = 0.08) -> list:
+    """Percentage-reversal ZigZag: return alternating swing pivots as a list of
+    (Timestamp, price) so the model gets real, precise turning points."""
+    close = close.dropna()
+    if len(close) < 3:
+        return [(t, float(v)) for t, v in close.items()]
+    idx = list(close.index)
+    px = [float(v) for v in close.values]
+
+    piv = [(idx[0], px[0])]
+    direction = 0            # +1 up-leg tracking, -1 down-leg, 0 not yet established
+    ext_p, ext_i = px[0], 0  # running extreme since the last confirmed pivot
+    for i in range(1, len(px)):
+        p = px[i]
+        if direction == 0:
+            if p >= piv[-1][1] * (1 + pct):
+                direction, ext_p, ext_i = 1, p, i
+            elif p <= piv[-1][1] * (1 - pct):
+                direction, ext_p, ext_i = -1, p, i
+        elif direction == 1:            # in an up-leg: track the high
+            if p > ext_p:
+                ext_p, ext_i = p, i
+            elif p <= ext_p * (1 - pct):  # reversal confirms the swing high
+                piv.append((idx[ext_i], ext_p))
+                direction, ext_p, ext_i = -1, p, i
+        else:                            # down-leg: track the low
+            if p < ext_p:
+                ext_p, ext_i = p, i
+            elif p >= ext_p * (1 + pct):  # reversal confirms the swing low
+                piv.append((idx[ext_i], ext_p))
+                direction, ext_p, ext_i = 1, p, i
+    # Append the final in-progress extreme if it advances past the last pivot.
+    if ext_i > 0 and idx[ext_i] != piv[-1][0]:
+        piv.append((idx[ext_i], ext_p))
+    return piv
+
+
+def _resample(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Return the frame at the requested timeframe (Daily passes through)."""
+    if timeframe == "Weekly":
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        cols = {k: v for k, v in agg.items() if k in df.columns}
+        out = df.resample("W-FRI").agg(cols).dropna(subset=["Close"])
+        return out
+    return df
+
+
+def fetch_ew_history(params: dict, timeframe: str):
+    """Load the longest sensible history for the selected instrument and return
+    (close_series, display_name, symbol, n_bars)."""
+    if params["is_psx_stock"]:
+        sym = params["psx_stock_symbol"]
+        df = load_psx_stock(sym, "5y")
+        name = load_psx_symbols().get(sym, sym)
+    elif params["is_psx"]:
+        sym = params["psx_symbol"]
+        df = load_psx_data(sym, "5y")
+        name = PSX_INDICES.get(sym, sym)
+    elif params["is_csv"]:
+        sym = params["csv_label"]
+        if params["uploaded_file"] is None:
+            raise ValueError("Upload a CSV first to run the report on it.")
+        df = load_csv_data(params["uploaded_file"])
+        name = params["csv_label"]
+    else:
+        sym = params["ticker"]
+        if not sym:
+            raise ValueError("Enter a ticker first.")
+        df = load_price_data(sym, "max")
+        name = load_ticker_name(sym)
+
+    wk = _resample(df, timeframe)
+    if len(wk) < 40:
+        raise ValueError(
+            f"Only {len(wk)} {timeframe.lower()} bars available — need at least 40 "
+            f"for a multi-degree count. Try the Daily timeframe or a longer history."
+        )
+    return wk["Close"], name, sym, len(wk)
+
+
+_DEEP_EW_SCHEMA = """
+Return ONLY one valid JSON object (no markdown/code fences) shaped EXACTLY:
+
+{
+  "position": "current wave position, e.g. 'Minor B of Int (2) of Primary 3 of Cycle B'",
+  "current_price": "string like '$1.94'",
+  "cycle_decline_pct": "string like '-97.92%' (peak-to-trough of the visible history), or ''",
+  "structure_type": "impulse | corrective | diagonal | unclear",
+  "cards": [{"label":"POSITION","value":"...","sub":"..."}],  // 4-5 concise status cards
+  "narrative": ["professional paragraph 1", "paragraph 2", "..."],
+  "rule_table": [
+    {"sequence":"Primary 1 (1.105 -> 2.700)",
+     "rule1":"e.g. '92.7% PASS' (W2 retrace of W1)",
+     "rule2":"e.g. '$0.615 / $1.280 / $0.725 - w3 longest PASS' (W1/W3/W5 lengths, W3 not shortest)",
+     "rule3":"e.g. 'w4 low 1.975 vs w1 high 1.720 - clears $0.255 PASS' (W4 vs W1 overlap)",
+     "alternation":"short note"}
+  ],
+  "completed_pivots": [
+    {"date":"YYYY-MM-DD","price": 0.0, "label":"1","degree":"Primary|Intermediate|Cycle|Minor"}
+  ],
+  "projected_path": [
+    {"date":"YYYY-MM-DD","price": 0.0, "label":"(3) $3.78"}
+  ],
+  "invalidation_price": 0.0,
+  "invalidation_label":"e.g. 'INVALID $1.3800'",
+  "retracement_zone": {"low": 0.0, "high": 0.0, "label":"0.618-0.786 grid"},
+  "targets": [{"name":"Int (2) target","price":"$1.8384","detail":"0.618 - wk 14 Sep low was $1.835"}],
+  "time_windows": [{"wave":"Int (3)","window":"Dec 2026 - Mar 2027","fib":"2.618 x (1) time"}],
+  "use_log_scale": true
+}
+
+Rules for the data you output:
+- completed_pivots MUST use the ACTUAL provided pivot dates & prices (you assign
+  the wave labels/degrees to them). Include the higher-degree labels on the pivots
+  that mark degree boundaries.
+- projected_path dates are in the FUTURE (after the last pivot date); prices are
+  your Fibonacci-derived targets. Give 3-6 points tracing the expected path.
+- invalidation_price and retracement_zone are real price numbers.
+- Compute every ratio in rule_table from the actual pivot prices; verify the three
+  inviolable rules (W2<=100% W1; W3 not shortest of 1/3/5; W4 no overlap with W1)
+  AND directional consistency. If a labelling violates a rule, RELABEL until valid.
+  If no clean impulse exists, set structure_type to 'corrective'/'unclear' and say so.
+"""
+
+
+def deep_elliott_analysis(
+    name: str, symbol: str, timeframe: str, pivots: list,
+    last_price: float, n_bars: int, model: str, api_key: str,
+) -> dict:
+    """Run a rigorous multi-degree Elliott Wave analysis on real swing pivots."""
+    try:
+        import anthropic
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError("The 'anthropic' package is not installed.") from e
+    if not api_key:
+        raise RuntimeError("No Anthropic API key provided.")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    lines = []
+    for t, p in pivots:
+        try:
+            lines.append(f"{pd.Timestamp(t).date()}: {p:.4f}")
+        except Exception:
+            continue
+    pivot_block = "\n".join(lines)
+
+    task = (
+        f"For educational technical-analysis practice, produce a rigorous, "
+        f"textbook-compliant, MULTI-DEGREE Elliott Wave analysis (Cycle -> Primary "
+        f"-> Intermediate, adding Minor where useful) for {name} ({symbol}) on the "
+        f"{timeframe} timeframe. This is general chart education about historical "
+        f"price data, not personalized financial advice.\n\n"
+        f"History: {n_bars} {timeframe.lower()} bars. Latest price: {last_price:.4f}.\n"
+        f"Actual swing pivots (date: price), oldest first:\n{pivot_block}\n\n"
+        f"Assign wave labels to these real pivots, compute the Fibonacci price and "
+        f"time relationships from them, verify all core Elliott Wave rules with "
+        f"actual numbers, give price targets, a projected future path, and the "
+        f"invalidation level.\n\n" + _DEEP_EW_SCHEMA
+    )
+
+    try:
+        with client.messages.stream(
+            model=model, max_tokens=24000,
+            system=_ANALYSIS_SYSTEM,
+            messages=[{"role": "user", "content": task}],
+        ) as stream:
+            resp = stream.get_final_message()
+    except anthropic.AuthenticationError as e:
+        raise RuntimeError("Anthropic rejected the API key (authentication error).") from e
+    except anthropic.RateLimitError as e:
+        raise RuntimeError("Anthropic rate limit hit — wait and retry.") from e
+    except anthropic.APIStatusError as e:
+        raise RuntimeError(f"Anthropic API error ({e.status_code}): {e.message}") from e
+    except anthropic.APIConnectionError as e:
+        raise RuntimeError("Could not reach Anthropic — check your connection.") from e
+
+    if getattr(resp, "stop_reason", None) == "refusal":
+        details = getattr(resp, "stop_details", None)
+        cat = getattr(details, "category", None) if details else None
+        raise RuntimeError(
+            f"The model declined (safety category: {cat or 'unspecified'}). Try "
+            f"Claude Sonnet 5 in the sidebar."
+        )
+    text = "".join(
+        b.text for b in resp.content if getattr(b, "type", "") == "text"
+    ).strip()
+    if not text:
+        raise ValueError("The model returned no text — please retry.")
+    return _parse_analysis_json(text)
+
+
+def build_ew_report_chart(close: pd.Series, data: dict) -> "go.Figure":
+    """Weekly/daily close with labelled completed pivots, dotted projected path,
+    invalidation line and retracement grid — the projection chart of the report."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=close.index, y=close.values, name="Close",
+            line=dict(color="#4C78D8", width=1.6),
+        )
+    )
+
+    comp = data.get("completed_pivots") or []
+    cx, cy, ct = [], [], []
+    for p in comp:
+        d = pd.to_datetime(p.get("date"), errors="coerce")
+        y = p.get("price")
+        if pd.isna(d) or y in (None, ""):
+            continue
+        cx.append(d); cy.append(float(y)); ct.append(str(p.get("label", "")))
+    if cx:
+        fig.add_trace(
+            go.Scatter(
+                x=cx, y=cy, mode="markers+text", text=ct, textposition="top center",
+                textfont=dict(size=11, color="#111"),
+                marker=dict(size=8, color="#E4572E", line=dict(width=1, color="#fff")),
+                name="Completed pivots",
+            )
+        )
+
+    # Projected path — future dates; if unparseable, sequence forward from last bar.
+    proj = data.get("projected_path") or []
+    last_date = close.index[-1]
+    step = (close.index[-1] - close.index[0]) / max(len(close) - 1, 1)
+    px_, py_, pt_ = [], [], []
+    for k, p in enumerate(proj, 1):
+        d = pd.to_datetime(p.get("date"), errors="coerce")
+        if pd.isna(d) or d <= last_date:
+            d = last_date + step * (4 * k)
+        y = p.get("price")
+        if y in (None, ""):
+            continue
+        px_.append(d); py_.append(float(y)); pt_.append(str(p.get("label", "")))
+    if cx and px_:
+        px_ = [cx[-1]] + px_
+        py_ = [cy[-1]] + py_
+        pt_ = [""] + pt_
+    if px_:
+        fig.add_trace(
+            go.Scatter(
+                x=px_, y=py_, mode="lines+markers+text", text=pt_,
+                textposition="top center", textfont=dict(size=11, color="#E4572E"),
+                line=dict(color="#E4572E", width=2, dash="dash"),
+                marker=dict(size=7, color="#E4572E"),
+                name="Projected path",
+            )
+        )
+
+    inv = data.get("invalidation_price")
+    if isinstance(inv, (int, float)) and inv:
+        fig.add_hline(
+            y=float(inv), line=dict(color="#C1121F", width=1.4, dash="dash"),
+            annotation_text=data.get("invalidation_label", f"Invalid {inv}"),
+            annotation_position="right",
+        )
+    rz = data.get("retracement_zone") or {}
+    lo, hi = rz.get("low"), rz.get("high")
+    if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and lo and hi:
+        fig.add_hrect(
+            y0=min(lo, hi), y1=max(lo, hi), fillcolor="#2E7D32",
+            opacity=0.10, line_width=0,
+            annotation_text=rz.get("label", ""), annotation_position="top left",
+        )
+
+    fig.update_layout(
+        template="plotly_white", height=560,
+        margin=dict(l=10, r=70, t=40, b=10),
+        legend=dict(orientation="h", y=1.04, x=0, font=dict(size=10)),
+        title=dict(text="Wave map — completed count & projected path", x=0.01,
+                   font=dict(size=14)),
+        yaxis=dict(type="log" if data.get("use_log_scale") else "linear"),
+        dragmode=False,
+    )
+    return fig
+
+
+# -----------------------------------------------------------------------------
 # Indicator + level engine
 # -----------------------------------------------------------------------------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -1525,6 +1804,165 @@ def _render_analysis_tabs(
     )
 
 
+def render_deep_ew(params: dict) -> None:
+    """Data-driven multi-degree Elliott Wave report for the selected instrument."""
+    st.markdown("## 🌊 Deep Elliott Wave Report")
+    st.caption(
+        "A rigorous multi-degree count (Cycle → Primary → Intermediate) computed "
+        "from the selected instrument's real history — rule-verified with actual "
+        "Fibonacci ratios, price/time targets and a projected path."
+    )
+
+    if not params.get("api_key"):
+        st.info(
+            "Add your Anthropic API key in the sidebar (or Streamlit secrets) to "
+            "generate the report."
+        )
+        return
+
+    c = st.columns([1, 1, 2])
+    timeframe = c[0].selectbox("Report timeframe", ["Weekly", "Daily"], index=0,
+                               key="ew_tf")
+    sens = c[1].slider("Swing sensitivity (%)", 3, 15, 8, key="ew_sens") / 100.0
+    c[2].caption(
+        "Weekly + ~8% suits multi-year higher-degree counts (like a weekly wave "
+        "map); Daily + a smaller % zooms into the active swing."
+    )
+
+    gen = st.button("🌊 Generate Deep Elliott Wave Report", type="primary")
+
+    src_key = (
+        params.get("ticker") or params.get("psx_stock_symbol")
+        or params.get("psx_symbol") or params.get("csv_label")
+    )
+    cache_key = f"{src_key}|{timeframe}|{sens}|{params['ai_model']}"
+    store = st.session_state.setdefault("_ew_report", {})
+
+    if gen and cache_key not in store:
+        try:
+            with st.spinner(
+                "Fetching full history and running the multi-degree Elliott Wave "
+                "analysis… (Opus 5 thinks for ~30–60s)"
+            ):
+                close, name, symbol, n = fetch_ew_history(params, timeframe)
+                pivots = zigzag_pivots(close, sens)
+                if len(pivots) < 5:
+                    st.warning(
+                        "Too few swing pivots at this sensitivity — lower the % or "
+                        "use a longer history."
+                    )
+                    return
+                data = deep_elliott_analysis(
+                    name, symbol, timeframe, pivots, float(close.iloc[-1]), n,
+                    params["ai_model"], params["api_key"],
+                )
+                store[cache_key] = {"data": data, "close": close,
+                                    "name": name, "symbol": symbol, "n": n}
+        except (RuntimeError, ValueError) as e:
+            st.error(f"❌ {e}")
+            return
+        except Exception as e:  # pragma: no cover
+            st.error(f"❌ Unexpected error: {e}")
+            return
+
+    bundle = store.get(cache_key)
+    if bundle:
+        _render_ew_report(bundle)
+    elif not gen:
+        st.caption("Pick a timeframe and click **Generate** to build the report.")
+
+
+def _render_ew_report(bundle: dict) -> None:
+    data = bundle["data"]
+    close = bundle["close"]
+
+    st.markdown(
+        f"### {bundle['name']} ({bundle['symbol']}) — {bundle['n']} bars · "
+        f"last {data.get('current_price', f'{float(close.iloc[-1]):,.2f}')}"
+    )
+    top = st.columns(3)
+    top[0].markdown(f"**Position:** {data.get('position', '—')}")
+    top[1].markdown(f"**Structure:** {data.get('structure_type', '—')}")
+    top[2].markdown(f"**Cycle decline:** {data.get('cycle_decline_pct', '—')}")
+
+    # Status cards
+    cards = data.get("cards") or []
+    if cards:
+        html = ['<div class="qtl-grid">']
+        for cd in cards:
+            html.append(
+                '<div class="qtl-card" style="--ac:#4C78D8;">'
+                f'<div class="lbl">{cd.get("label", "")}</div>'
+                f'<div class="val" style="font-size:1.05rem;">{cd.get("value", "")}</div>'
+                f'<div class="sub">{cd.get("sub", "")}</div></div>'
+            )
+        html.append("</div>")
+        st.markdown("".join(html), unsafe_allow_html=True)
+
+    # Projection chart
+    st.plotly_chart(
+        build_ew_report_chart(close, data), use_container_width=True,
+        config={"displayModeBar": False},
+    )
+
+    # Rule verification table
+    rt = data.get("rule_table") or []
+    if rt:
+        st.markdown("#### Rule verification — motive sequences")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Sequence": r.get("sequence", ""),
+                    "Rule 1 — W2 ≤ 100% W1": r.get("rule1", ""),
+                    "Rule 2 — W3 not shortest": r.get("rule2", ""),
+                    "Rule 3 — W4 clear of W1": r.get("rule3", ""),
+                    "Alternation": r.get("alternation", ""),
+                }
+                for r in rt
+            ]),
+            use_container_width=True, hide_index=True,
+        )
+
+    # Targets and time windows
+    cols = st.columns(2)
+    with cols[0]:
+        tg = data.get("targets") or []
+        if tg:
+            st.markdown("#### Price targets")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Target": t.get("name", ""), "Price": t.get("price", ""),
+                     "Basis": t.get("detail", "")}
+                    for t in tg
+                ]),
+                use_container_width=True, hide_index=True,
+            )
+    with cols[1]:
+        tw = data.get("time_windows") or []
+        if tw:
+            st.markdown("#### Fibonacci time windows")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Wave": w.get("wave", ""), "Window": w.get("window", ""),
+                     "Fib": w.get("fib", "")}
+                    for w in tw
+                ]),
+                use_container_width=True, hide_index=True,
+            )
+
+    # Narrative
+    narr = data.get("narrative") or []
+    if narr:
+        st.markdown("#### Analysis")
+        for para in narr:
+            st.write(para)
+
+    st.caption(
+        "Multi-degree AI Elliott Wave read for education only — not financial "
+        "advice. Wave counts are interpretive; verify independently."
+    )
+
+
 def main() -> None:
     inject_css()
     st.title("📈 Quant Trade Levels")
@@ -1693,6 +2131,10 @@ def main() -> None:
         f"Data via {data_src} · {params['period_label']} lookback · "
         f"Last bar: {df.index[-1].date()} · Generated {_dt.date.today()}"
     )
+
+    # --- Deep multi-degree Elliott Wave report (data-driven, on-demand) --------
+    st.markdown("---")
+    render_deep_ew(params)
 
 
 if __name__ == "__main__":
