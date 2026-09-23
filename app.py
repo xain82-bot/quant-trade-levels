@@ -871,13 +871,33 @@ def deep_elliott_analysis(
         f"invalidation level.\n\n" + _DEEP_EW_SCHEMA
     )
 
-    try:
-        with client.messages.stream(
-            model=model, max_tokens=24000,
-            system=_ANALYSIS_SYSTEM,
+    def _run(effort: str, max_tokens: int):
+        # Bound the extended thinking with `effort` so it can't consume the whole
+        # budget before the JSON is written, and stream so the large budget does
+        # not hit HTTP timeouts.
+        kwargs = dict(
+            model=model, max_tokens=max_tokens, system=_ANALYSIS_SYSTEM,
             messages=[{"role": "user", "content": task}],
-        ) as stream:
-            resp = stream.get_final_message()
+            output_config={"effort": effort},
+        )
+        try:
+            with client.messages.stream(**kwargs) as stream:
+                return stream.get_final_message()
+        except anthropic.BadRequestError:
+            kwargs.pop("output_config", None)  # effort unsupported → retry plain
+            with client.messages.stream(**kwargs) as stream:
+                return stream.get_final_message()
+
+    def _text(r):
+        return "".join(
+            b.text for b in r.content if getattr(b, "type", "") == "text"
+        ).strip()
+
+    try:
+        resp = _run("medium", 32000)
+        # If thinking still ate the budget, retry once at low effort with more room.
+        if getattr(resp, "stop_reason", None) == "max_tokens" and not _text(resp):
+            resp = _run("low", 40000)
     except anthropic.AuthenticationError as e:
         raise RuntimeError("Anthropic rejected the API key (authentication error).") from e
     except anthropic.RateLimitError as e:
@@ -894,11 +914,12 @@ def deep_elliott_analysis(
             f"The model declined (safety category: {cat or 'unspecified'}). Try "
             f"Claude Sonnet 5 in the sidebar."
         )
-    text = "".join(
-        b.text for b in resp.content if getattr(b, "type", "") == "text"
-    ).strip()
+    text = _text(resp)
     if not text:
-        raise ValueError("The model returned no text — please retry.")
+        raise ValueError(
+            "The analysis didn't finish in the token budget. Retry, or switch to "
+            "Claude Sonnet 5 (faster, lighter reasoning) in the sidebar."
+        )
     return _parse_analysis_json(text)
 
 
