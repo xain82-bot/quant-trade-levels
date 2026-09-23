@@ -386,7 +386,6 @@ Return ONLY a single valid JSON object (no markdown, no code fences, no prose
 outside the JSON) with EXACTLY this shape:
 
 {
-  "reasoning": "REQUIRED. Work the Elliott count out here step by step BEFORE filling the fields below: state the impulse direction, list each pivot with its y, then explicitly verify wave2-vs-start, wave3>wave1, wave4-no-overlap, wave5>wave3, wave3-not-shortest. If any check fails, re-label until it passes. This field is your scratchpad and is not shown to the user.",
   "instrument_guess": "string - ticker/name if visible, else 'Unknown'",
   "timeframe_guess": "string - e.g. '1H', 'Daily', 'Weekly', else 'Unknown'",
   "descriptive": {
@@ -524,15 +523,16 @@ def analyze_chart_image(
         ]
 
     def _call(note: str):
-        kwargs = dict(
-            model=model, max_tokens=16000, system=_ANALYSIS_SYSTEM,
+        # Let the model reason NATIVELY (extended thinking is on by default for
+        # both Opus 5 and Sonnet 5) — this is what makes the Elliott rule-checking
+        # reliable, and it avoids the 'reasoning_extraction' filter that a
+        # reasoning-dump output field would trip. Streaming keeps the larger
+        # token budget from hitting HTTP timeouts.
+        with client.messages.stream(
+            model=model, max_tokens=20000, system=_ANALYSIS_SYSTEM,
             messages=[{"role": "user", "content": _content(note)}],
-        )
-        # Thinking OFF so the whole budget goes to the JSON answer.
-        try:
-            return client.messages.create(thinking={"type": "disabled"}, **kwargs)
-        except anthropic.BadRequestError:
-            return client.messages.create(**kwargs)
+        ) as stream:
+            return stream.get_final_message()
 
     try:
         resp = _call("")
