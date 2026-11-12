@@ -205,6 +205,7 @@ showRange         = input.bool(true, "Show 1H dealing range", group = GV)
 showPD            = input.bool(true, "Premium / discount shading", group = GV)
 showZones         = input.bool(true, "Show 1H FVG / OB zones", group = GV)
 showPlans         = input.bool(true, "Show entry plans", group = GV)
+showTradeBoxes    = input.bool(true, "Show trade boxes (risk / reward)", group = GV, tooltip = "Position-tool style boxes: red = entry → stop (−1R), green = entry → final target (TP2, or TP1 if none).")
 showRejected      = input.bool(false, "Show rejected sweeps (debug)", group = GV)
 showDash          = input.bool(true, "Show dashboard", group = GV)
 dashPos           = input.string("Top right", "Dashboard position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = GV)
@@ -673,6 +674,9 @@ int poolCap = maxZones + 10      // + 10 reserved for named key/session levels
 var array<Level> pools    = array.new<Level>()    // ranks 1–3
 var array<Level> intPools = array.new<Level>()    // rank 4
 var array<Zone>  zones    = array.new<Zone>()
+// Funnel diagnostics per direction: [C1, rejected at C1, MSS, ARMED, skipped, cancelled] × [long, short]
+var array<int>    diag    = array.new<int>(12, 0)
+var array<string> lastWhy = array.from("", "")
 var SessTrack stAsia   = SessTrack.new()
 var SessTrack stLondon = SessTrack.new()
 var SessTrack stMain   = SessTrack.new()
@@ -984,7 +988,14 @@ f_targets(int d, float entryN, float refN, float riskN) =>
 f_newSetup(int d) =>
     Setup.new(direction = d, events = array.new<string>(), lines = array.new<line>(), lbls = array.new<label>(), boxes = array.new<box>())
 
+f_diag(int d, int k) =>
+    int idx = k * 2 + (d == 1 ? 0 : 1)
+    array.set(diag, idx, array.get(diag, idx) + 1)
+
 f_ev(Setup s, string code) =>
+    int k = code == "C1" ? 0 : code == "MSS" ? 2 : code == "ARMED" ? 3 : -1
+    if k >= 0
+        f_diag(s.direction, k)
     array.push(s.events, code)
 
 f_avg(Setup s) =>
@@ -1025,6 +1036,9 @@ f_end(Setup s, int st, string why) =>
     s.state  := st
     s.endBar := bar_index
     s.result := why
+    if st == ST_SKIPPED or st == ST_CANCELLED
+        f_diag(s.direction, st == ST_SKIPPED ? 4 : 5)
+        array.set(lastWhy, s.direction == 1 ? 0 : 1, why)
     for ln in s.lines
         if line.get_x2(ln) > bar_index
             line.set_x2(ln, bar_index)
@@ -1091,6 +1105,14 @@ f_drawPlan(Setup s) =>
                 f_hline(s, s.fvgTop, "alt E1 top " + f_fmt(d * s.fvgTop), color.new(colEntry, 40), 1, line.style_dotted)
         else
             f_hline(s, s.entry1, (s.entryModel == 3 ? "E3 " : s.isReentry ? "E5 re-entry ½R " : "E5 ") + f_fmt(d * s.entry1) + star, colEntry, 2, line.style_solid)
+        if showTradeBoxes
+            float fin = na(s.tp2) ? s.tp1 : s.tp2
+            float ye  = d * s.avgPlan
+            float ys  = d * s.stop0
+            float yt  = d * fin
+            string bt = f_modelShort(s.entryModel) + (s.starter ? " starter" : "") + " · R:R " + (na(s.rr) ? "—" : str.tostring(s.rr, "#.#")) + " · score " + str.tostring(s.score) + "/7"
+            array.push(s.boxes, box.new(bar_index, math.max(ye, yt), bar_index + 20, math.min(ye, yt), border_color = color.new(colTarget, 50), bgcolor = color.new(colTarget, 80), text = bt, text_size = size.small, text_color = color.new(colTarget, 0), text_halign = text.align_left, text_valign = d == 1 ? text.align_top : text.align_bottom))
+            array.push(s.boxes, box.new(bar_index, math.max(ye, ys), bar_index + 20, math.min(ye, ys), border_color = color.new(colStop, 50), bgcolor = color.new(colStop, 80), text = "−1R", text_size = size.small, text_color = color.new(colStop, 0), text_halign = text.align_left, text_valign = d == 1 ? text.align_bottom : text.align_top))
         line sl = f_hline(s, s.stop, "SL " + f_fmt(d * s.stop) + " · −1R (" + s.stopTxt + ")", colStop, 2, line.style_solid)
         s.stopLine := sl
         s.stopLbl  := array.last(s.lbls)
@@ -1747,7 +1769,11 @@ f_tryC1(Setup s, float lvlN, int rank, string name) =>
             s.state := ST_WAIT_REC
         else
             s.state := ST_WAIT_MSS
-    else if sigOn and showRejected
+    else if sigOn
+        f_diag(d, 1)
+        if rank <= 3
+            array.set(lastWhy, d == 1 ? 0 : 1, "C1 rejected (" + name + "): " + why)
+    if sigOn and why != "" and showRejected
         label.new(bar_index, d == 1 ? low : high, "×", tooltip = "Sweep of " + name + " rejected: " + why, style = d == 1 ? label.style_label_up : label.style_label_down, color = color(na), textcolor = colNeutral, size = size.tiny)
     true
 
@@ -1996,7 +2022,7 @@ f_tblPos(string p) =>
         "Middle right" => position.middle_right
         => position.top_right
 
-var table dash = table.new(f_tblPos(dashPos), 3, 25, bgcolor = color.new(chart.bg_color, 5), frame_color = color.new(colNeutral, 50), frame_width = 1, border_color = color.new(colNeutral, 80), border_width = 1)
+var table dash = table.new(f_tblPos(dashPos), 3, 27, bgcolor = color.new(chart.bg_color, 5), frame_color = color.new(colNeutral, 50), frame_width = 1, border_color = color.new(colNeutral, 80), border_width = 1)
 
 f_cell(int c, int r, string tx, color tc) =>
     table.cell(dash, c, r, tx, text_color = tc, text_size = size.small, text_halign = c == 0 ? text.align_left : text.align_center)
@@ -2063,6 +2089,12 @@ if showDash and barstate.islast
     f_cell(0, 21, "Re-entries", fg)
     f_cell(0, 22, "Flags", fg)
     f_cell(0, 23, "Result", fg)
+    f_cell(0, 24, "Funnel C1·rej·MSS·arm·skip·canc", fg)
+    f_cell(0, 25, "Last drop-out", fg)
+    for i = 0 to 1
+        string fn = str.tostring(array.get(diag, i)) + " · " + str.tostring(array.get(diag, 2 + i)) + " · " + str.tostring(array.get(diag, 4 + i)) + " · " + str.tostring(array.get(diag, 6 + i)) + " · " + str.tostring(array.get(diag, 8 + i)) + " · " + str.tostring(array.get(diag, 10 + i))
+        f_cell(i + 1, 24, fn, fg)
+        f_cell(i + 1, 25, array.get(lastWhy, i) == "" ? "—" : array.get(lastWhy, i), colNeutral)
     f_dashSetup(1, sL)
     f_dashSetup(2, sS)
 
