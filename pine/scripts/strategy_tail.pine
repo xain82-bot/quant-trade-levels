@@ -1,0 +1,111 @@
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// PHASE 2 · ORDER ROUTING — mirror the engine's decisions in the broker emulator
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//  Entry ids per direction: "<L|S>1" tier-1 / single entry · "<L|S>2" E2 tier-2 limit · "<L|S>A" E5 add.
+//  Exit ids: "-TP1" (tp1Pct) · "-TP2" · "-RUN"; all carry the engine's current stop (BE / trail).
+//  Exit percentages are re-issued relative to the REMAINING position at each stage.
+f_ordComment(Setup s) =>
+    f_modelShort(s.entryModel) + "·" + f_gradeTxt(s.grade) + "·" + f_riskTxt(s.risk) + "·s" + str.tostring(s.score)
+
+f_route(Setup s) =>
+    int    d      = s.direction
+    string p      = d == 1 ? "L" : "S"
+    bool   engIn  = s.state == ST_INTRADE or s.state == ST_TRAIL
+    bool   posDir = d == 1 ? strategy.position_size > 0 : strategy.position_size < 0
+    // ── E1 limit (also MODERATE-risk starters)
+    if s.state == ST_ARMED and s.entryModel == 1 and s.q1 > 0
+        strategy.entry(p + "1", d == 1 ? strategy.long : strategy.short, qty = s.q1, limit = d * s.entry1, comment = f_ordComment(s))
+    else if not engIn
+        strategy.cancel(p + "1")
+    // ── market fills on the signal close (E2 tier-1, E3, E5, E5 re-entry)
+    if engIn and s.fillBar == bar_index and s.entryModel != 1 and s.q1 > 0 and not posDir
+        strategy.entry(p + "1", d == 1 ? strategy.long : strategy.short, qty = s.q1, comment = f_ordComment(s))
+    // ── E2 tier-2 limit at the FVG top edge
+    if engIn and s.entryModel == 2 and not s.t2Filled and not s.tp1Hit and s.q2 > 0
+        strategy.entry(p + "2", d == 1 ? strategy.long : strategy.short, qty = s.q2, limit = d * s.entry2, comment = "E2b")
+    else
+        strategy.cancel(p + "2")
+    // ── E5 add of the main size (MODERATE-risk starter)
+    if engIn and s.starter and s.addQty > 0 and array.includes(s.events, "E5")
+        strategy.entry(p + "A", d == 1 ? strategy.long : strategy.short, qty = s.addQty, comment = "E5 add")
+    // ── exits
+    if engIn
+        float st = d * s.stop
+        float t1 = d * s.tp1
+        float t2 = na(s.tp2) ? t1 : d * s.tp2
+        bool  hasRun = not na(s.runner) and not na(s.tp2)
+        if not s.tp1Hit
+            strategy.exit(p + "-TP1", qty_percent = tp1Pct, limit = t1, stop = st, comment_profit = "TP1", comment_loss = "SL")
+            strategy.exit(p + "-TP2", qty_percent = hasRun ? (100 - tp1Pct) / 2.0 : 100, limit = t2, stop = st, comment_profit = "TP2", comment_loss = "SL")
+        else
+            strategy.cancel(p + "-TP1")
+            if not s.tp2Hit
+                strategy.exit(p + "-TP2", qty_percent = hasRun ? 50 : 100, limit = t2, stop = st, comment_profit = "TP2", comment_loss = "SL/BE")
+            else
+                strategy.cancel(p + "-TP2")
+        if hasRun
+            strategy.exit(p + "-RUN", qty_percent = 100, limit = d * s.runner, stop = st, comment_profit = "Runner", comment_loss = "Trail")
+        else
+            strategy.cancel(p + "-RUN")
+    else
+        strategy.cancel(p + "-TP1")
+        strategy.cancel(p + "-TP2")
+        strategy.cancel(p + "-RUN")
+        // engine is flat (time stop, invalidation, EOD, or a stop the emulator missed) → sync
+        if posDir
+            strategy.close_all(comment = s.result != "" ? s.result : "sync")
+    true
+
+if barstate.isconfirmed and placeOrders
+    f_route(sL)
+    f_route(sS)
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// PHASE 2 · R STATISTICS TABLE + TRADE LOG
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+var array<string> bNames = array.from("All trades", "E1 FVG retest", "E2 tiered", "E3 continuation", "E4 1M refine", "E5 2nd sweep", "Grade A", "Grade B", "Grade C", "Risk LOW", "Risk MOD", "Risk HIGH", "Opening vol", "Prime", "Midday", "Afternoon", "Late session", "Long", "Short")
+var table stats = table.new(f_tblPos(statsPos), 6, NB + 5 + logRows, bgcolor = color.new(chart.bg_color, 5), frame_color = color.new(colNeutral, 50), frame_width = 1, border_color = color.new(colNeutral, 80), border_width = 1)
+
+f_sc(int c, int r, string tx, color tc) =>
+    table.cell(stats, c, r, tx, text_color = tc, text_size = size.small, text_halign = c == 0 ? text.align_left : text.align_right)
+
+if showStats and barstate.islast
+    color fg = chart.fg_color
+    f_sc(0, 0, "LSM R ledger", fg)
+    f_sc(1, 0, "n", fg)
+    f_sc(2, 0, "Win %", fg)
+    f_sc(3, 0, "Avg R", fg)
+    f_sc(4, 0, "Total R", fg)
+    f_sc(5, 0, "PF", fg)
+    for i = 0 to NB - 1
+        float n   = array.get(bN, i)
+        float sm  = array.get(bSum, i)
+        float gp  = array.get(bGP, i)
+        float gl  = array.get(bGL, i)
+        color rc  = n == 0 ? colNeutral : sm > 0 ? colTarget : sm < 0 ? colStop : fg
+        bool  sep = i == 1 or i == 6 or i == 9 or i == 12 or i == 17
+        f_sc(0, i + 1, (sep ? "· " : "") + array.get(bNames, i), i == 0 ? fg : color.new(fg, 15))
+        f_sc(1, i + 1, str.tostring(n, "#"), fg)
+        f_sc(2, i + 1, n > 0 ? str.tostring(array.get(bWin, i) / n * 100, "#") + "%" : "—", fg)
+        f_sc(3, i + 1, n > 0 ? f_fmtR(sm / n) : "—", rc)
+        f_sc(4, i + 1, n > 0 ? f_fmtR(sm) : "—", rc)
+        f_sc(5, i + 1, gl > 0 ? str.tostring(gp / gl, "#.##") : gp > 0 ? "∞" : "—", fg)
+    int r0 = NB + 1
+    f_sc(0, r0, "Max drawdown", fg)
+    f_sc(4, r0, f_fmtR(-array.get(bPeak, 1)), colStop)
+    f_sc(0, r0 + 1, "Tester net P&L", fg)
+    f_sc(4, r0 + 1, str.tostring(strategy.netprofit, "#,###.##") + " " + syminfo.currency, strategy.netprofit >= 0 ? colTarget : colStop)
+    if logRows > 0
+        f_sc(0, r0 + 2, "Last trades", fg)
+        int nl = math.min(logRows, array.size(logTx))
+        if nl > 0
+            for j = 0 to nl - 1
+                float lr = array.get(logR, j)
+                f_sc(0, r0 + 3 + j, array.get(logTx, j), color.new(fg, 15))
+                f_sc(4, r0 + 3 + j, f_fmtR(lr), lr > 0 ? colTarget : lr < 0 ? colStop : colNeutral)
+
+// Data-window export (copy from the data window / "Export chart data" for spreadsheet tuning)
+plot(array.get(lastTradeBar, 0) == bar_index ? array.get(lastTradeR, 0) : na, "LSM trade R (closed this bar)", display = display.data_window)
+plot(array.get(bSum, 0), "LSM cumulative R", display = display.data_window)
+plot(array.get(bN, 0), "LSM trades counted", display = display.data_window)

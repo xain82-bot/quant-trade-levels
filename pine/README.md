@@ -84,7 +84,67 @@ The data window shows `LSM state code / score / direction / grade / risk / R:R /
 * **`alertcondition()`:** separate static conditions for C1, reclaim, MSS, ARMED, entry, E5, TP1, BE,
   time stop, re-entry and invalidation.
 
-## Phase 2 (after Phase 1 is confirmed)
+## Phase 2 — `LSM_1H_5M_Strategy.pine` (backtest companion)
 
-The next step is a companion `strategy()` built on the same engine. It will report realised R per trade, and R broken down by
-entry model, C1 grade, second-sweep risk and session window, so the thresholds can be tuned from data.
+The strategy is generated from the indicator: the engine (inputs, state machine, gates, grading,
+sizing, virtual trade management) is **identical**, so a backtest exercises exactly what the
+indicator shows. On top of the engine it adds three things.
+
+**1. Order routing to the Strategy Tester** (`Route orders` input)
+
+| Engine event | Order |
+|---|---|
+| E1 / starter ARMED | `strategy.entry` **limit** at the E1 price, re-issued every bar until filled, expired or cancelled |
+| E2 tier-1, E3, E5, E5 re-entry | **market** entry on the signal close (`process_orders_on_close = true`) |
+| E2 tier-2 | limit at the FVG top edge while TP1 has not been hit |
+| E5 add (MODERATE-risk starter) | market add of the reserved main size |
+| TP1 / TP2 / runner | `strategy.exit` with `tp1Pct` → TP2 (half of the rest if a runner exists) → runner; every exit carries the engine's current stop, so BE moves and trailing are mirrored |
+| Time stop, invalidation, EOD flat, engine/emulator mismatch | `strategy.close_all` |
+
+Sizing uses `strategy.equity × riskPct` by default (or the fixed amount / account size), multiplied by the
+score tier, starter, midday and re-entry factors, and rounded down to `lotSize`.
+A strategy cannot be long and short at the same time, so the strategy adds one extra gate:
+**no new setup is armed while the opposite direction is ARMED or in a trade.** Apart from this gate,
+the strategy fires the same signals as the indicator.
+
+**2. R ledger.** Every completed virtual trade is recorded with its **realised R**, measured against the
+planned risk budget (partials, BE and trail included, so an 0.33× starter shows as 0.33× R). Trades are
+bucketed by:
+
+* entry model — E1, E2, E3, E4 (reserved; E4 is shown as an alternative, not traded), E5
+* C1 grade — A / B / C
+* second-sweep risk — LOW / MOD / HIGH, as it stood at entry
+* session window at fill — Opening, Prime, Midday, Afternoon, Late
+* direction — long / short
+
+The table shows n, win %, average R, total R and profit factor (in R) for each bucket, plus max drawdown
+in R, the tester's net P&L, and a log of the last N trades. Each closed trade also gets an R label on
+the chart. Data-window series (`trade R`, `cumulative R`, `trades counted`) can be exported with
+*Export chart data* for spreadsheet work. Use **Count trades from** to split in-sample and
+out-of-sample periods.
+
+**3. How to tune.** Use the R ledger, not the tester's P&L. The ledger is deterministic and matches the
+indicator. The broker emulator can differ slightly: intrabar fill order, gaps through stops, lot rounding,
+and qty = 0 when one lot exceeds the risk budget (the ledger still records the trade). Typical loop:
+
+1. Run a symbol over its full 5m history. Read the buckets: does E5 beat C1 entries when risk is HIGH?
+   Is grade C worth trading? Is the prime window really better?
+2. Change one threshold (e.g. `dispBodyMult`, `deepZoneATR`, `minRR`, `timeStopBars`) and compare total R,
+   average R and PF on the same date range.
+3. Confirm on the out-of-sample range by moving **Count trades from**.
+
+Notes:
+
+* `alertcondition()` is not allowed in strategies. `alert()` JSON events still fire.
+* Set *Properties → Initial capital* to match your account when sizing from equity.
+
+**Keeping the two files in sync.** The strategy is generated, so don't edit it by hand. Change the
+indicator, then run the command below from the repo root. `pine/scripts/make_strategy.py` applies
+asserted edits to the indicator: the strategy() header, backtest inputs, ledger fields, sizing from
+equity and the opposite-position gate. It then appends `pine/scripts/strategy_tail.pine` (order
+routing + statistics). Every edit must match exactly once, so if the indicator drifts, the script
+stops with an error instead of producing a silently broken strategy.
+
+```bash
+python3 pine/scripts/make_strategy.py
+```
